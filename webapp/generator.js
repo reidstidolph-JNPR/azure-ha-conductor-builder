@@ -39,8 +39,8 @@
     {
       id: 'resourceGroup', section: 'azure', label: 'Resource group', kind: 'text', required: true,
       ph: '<input-your-resource-group>',
-      help: 'Existing resource group the conductor VMs, NICs, NSGs (and optional public IPs) are created in.',
-      usedIn: [`${F.mop}: --resource-group of every az command`],
+      help: 'Existing resource group the conductor VMs, NICs, NSGs (and optional public IPs) are created in. node1 uses it too unless "node1 resource group" is set.',
+      usedIn: [`${F.mop}: --resource-group of node0 az commands (and node1's by default)`, `${F.p1}: virtualNetworkResourceGroup, managedIdentityResourceGroup (when node1 has its own resource group and these are empty)`],
       validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
     {
@@ -59,7 +59,7 @@
     },
     {
       id: 'virtualNetworkResourceGroup', section: 'azure', label: 'VNet resource group', kind: 'text', def: '',
-      help: 'Only needed when the VNet lives in a different resource group. Empty = deployment resource group.',
+      help: 'Only needed when the VNet lives in a different resource group. Empty = node0\'s resource group.',
       usedIn: [`${F.p0}: virtualNetworkResourceGroup`, `${F.p1}: virtualNetworkResourceGroup`],
       validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
@@ -79,7 +79,7 @@
     },
     {
       id: 'managedIdentityResourceGroup', section: 'azure', label: 'Managed identity resource group', kind: 'text', def: '',
-      help: 'Only needed when the identity lives in a different resource group. Empty = deployment resource group.',
+      help: 'Only needed when the identity lives in a different resource group. Empty = node0\'s resource group.',
       usedIn: [`${F.p0}: managedIdentityResourceGroup`, `${F.p1}: managedIdentityResourceGroup`],
       validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
@@ -91,7 +91,7 @@
     },
     {
       id: 'availabilitySetName', section: 'azure', label: 'Availability set name', kind: 'text', def: '',
-      help: 'Existing availability set for regions without availability zones. Leave empty when using zones.',
+      help: 'Existing availability set for regions without availability zones. Leave empty when using zones. Both VMs must be in its resource group, so it cannot be combined with a separate node1 resource group.',
       usedIn: [`${F.p0}: availabilitySetName`, `${F.p1}: availabilitySetName`],
       validate: re(AZ_NAME, 'Not a valid availability set name'),
     },
@@ -108,7 +108,7 @@
     {
       id: 'publicIpResourceGroup', section: 'azure', label: 'Existing public IP resource group', kind: 'text', def: '',
       when: { field: 'publicIpMode', equals: 'existing' },
-      help: 'Only needed when the existing public IPs live in a different resource group. Empty = deployment resource group.',
+      help: 'Only needed when the existing public IPs live in a different resource group than their node. Empty = each node\'s own resource group.',
       usedIn: [`${F.p0}: existingPublicIpResourceGroup`, `${F.p1}: existingPublicIpResourceGroup`],
       validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
@@ -164,6 +164,12 @@
       help: 'Azure VM name of the secondary node.',
       usedIn: [`${F.p1}: instanceName`, `${F.mop}: --name of node1 az vm commands`],
       validate: re(VM_NAME, 'Not a valid Azure VM name'),
+    },
+    {
+      id: 'node1ResourceGroup', section: 'nodes', label: 'node1 resource group', kind: 'text', def: '',
+      help: 'Existing resource group for node1\'s VM, NIC, NSG (and public IP) when it differs from node0\'s. Empty = same resource group as node0. The VNet and managed identity are still looked up in node0\'s resource group unless their own resource group is set.',
+      usedIn: [`${F.mop}: --resource-group of node1 az commands`],
+      validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
     {
       id: 'node1PrivateIp', section: 'nodes', label: 'node1 private IP', kind: 'text', required: true,
@@ -317,6 +323,24 @@
     return { mode: 'none', name: '' };
   }
 
+  /* Resource group a node's VM, NIC, NSG and public IP are deployed to. */
+  function nodeResourceGroup(values, node) {
+    return (node === 1 && resolve(values, 'node1ResourceGroup')) || resolve(values, 'resourceGroup');
+  }
+
+  /* True when node1 is deployed to a different resource group than node0 (names are case-insensitive). */
+  function separateResourceGroups(values) {
+    return nodeResourceGroup(values, 0).toLowerCase() !== nodeResourceGroup(values, 1).toLowerCase();
+  }
+
+  /* Resource group of a resource shared by both nodes (VNet, identity) as written to a node's params file:
+   * '' lets the template use the node's own resource group, which is only right when that is node0's. */
+  function sharedResourceGroup(values, id, node) {
+    const set = resolve(values, id);
+    if (set) return set;
+    return node === 1 && separateResourceGroups(values) ? nodeResourceGroup(values, 0) : '';
+  }
+
   function onboardingConfig(values, node) {
     const s = (id) => resolve(values, id);
     const nodeName = `node${node}`;
@@ -392,9 +416,9 @@
         availabilityZone: p(s(`${self}Zone`)),
         availabilitySetName: p(s('availabilitySetName')),
         managedIdentity: p(s('managedIdentity')),
-        managedIdentityResourceGroup: p(s('managedIdentityResourceGroup')),
+        managedIdentityResourceGroup: p(sharedResourceGroup(values, 'managedIdentityResourceGroup', node)),
         virtualNetworkName: p(s('virtualNetworkName')),
-        virtualNetworkResourceGroup: p(s('virtualNetworkResourceGroup')),
+        virtualNetworkResourceGroup: p(sharedResourceGroup(values, 'virtualNetworkResourceGroup', node)),
         controlSubnetName: p(s('controlSubnetName')),
         controlPrivateIp: p(s(`${self}PrivateIp`)),
         haPeerPrivateIp: p(s(`${peer}PrivateIp`)),
@@ -490,22 +514,22 @@
   /* Ordered MOP steps: [{ title, text, cmd, expect }] */
   function mopSteps(values) {
     const s = (id) => resolve(values, id);
-    const rg = ['--resource-group', s('resourceGroup')];
+    const rgOf = (n) => ['--resource-group', nodeResourceGroup(values, n)];
     const vm0 = s('node0VmName');
     const vm1 = s('node1VmName');
     const deploy = (n) => az(['deployment', 'group', 'create'], [
-      rg, ['--name', `ssr-conductor-node${n}`], ['--template-file', F.template],
+      rgOf(n), ['--name', `ssr-conductor-node${n}`], ['--template-file', F.template],
       ['--parameters', `@conductor-node${n}-params.json`, `customData=@conductor-node${n}-cloud-init.txt`],
       ['--query', 'properties.provisioningState'], ['--output', 'tsv'],
     ]);
-    const runCommand = (vm, script) => az(['vm', 'run-command', 'invoke'], [
-      rg, ['--name', vm], ['--command-id', 'RunShellScript'], ['--scripts', script],
+    const runCommand = (n, script) => az(['vm', 'run-command', 'invoke'], [
+      rgOf(n), ['--name', n === 0 ? vm0 : vm1], ['--command-id', 'RunShellScript'], ['--scripts', script],
       ['--query', 'value[0].message'], ['--output', 'tsv'],
     ]);
     return [
       {
         title: 'Confirm the Azure subscription',
-        text: 'Make sure Cloud Shell targets the subscription that contains the resource group. If not, run `az account set --subscription <name-or-id>`.',
+        text: `Make sure Cloud Shell targets the subscription that contains the resource group${separateResourceGroups(values) ? 's' : ''}. If not, run \`az account set --subscription <name-or-id>\`.`,
         cmd: az(['account', 'show'], [['--query', '[name, id]'], ['--output', 'tsv']]),
         expect: 'The target subscription name and ID.',
       },
@@ -526,13 +550,13 @@
       {
         title: 'Wait until node0 is initialized',
         text: 'The VM downloads and installs SSR, initializes the conductor and reboots. This usually takes 20-40 minutes. Repeat the command every 5 minutes. Do not continue until the state is READY.',
-        cmd: runCommand(vm0, STATUS_SCRIPT),
+        cmd: runCommand(0, STATUS_SCRIPT),
         expect: '`STATE=READY`, followed by the global.init content listing conductor `node0`. `STATE=FAILED` means the bootstrapper failed (see Troubleshooting).',
       },
       {
         title: 'Open temporary HA peer access on node0',
         text: `Lets node1 (${s('node1PrivateIp')}) log in to node0 as t128 with the temporary HA peer password, which the initializer on node1 needs to learn the conductor setup from node0. It sets the temporary password, makes sudo prompt for it, and allows SSH password login for t128 only from node1. This automates "Configure Node A" in the Conductor HA for Cloud Deployments documentation. Step 8 reverts it.`,
-        cmd: runCommand(vm0, openPeerScript(s('haPeerPassword'), s('node1PrivateIp'))),
+        cmd: runCommand(0, openPeerScript(s('haPeerPassword'), s('node1PrivateIp'))),
         expect: '`HA_PEER_ACCESS_OPEN`',
       },
       {
@@ -544,25 +568,25 @@
       {
         title: 'Wait until node1 has joined',
         text: 'Repeat every 5 minutes (20-40 minutes). Do not continue until node1 is READY and its global.init lists both conductors.',
-        cmd: runCommand(vm1, STATUS_SCRIPT),
+        cmd: runCommand(1, STATUS_SCRIPT),
         expect: '`STATE=READY`, and global.init lists `node0` and `node1` with their IP addresses.',
       },
       {
         title: 'Close HA peer access on node0',
         text: 'Removes the SSH password exception, restores the original sudo rules, and resets t128 to the password from the onboarding configuration. The temporary password stops working.',
-        cmd: runCommand(vm0, closePeerScript(s('t128PasswordHash'))),
+        cmd: runCommand(0, closePeerScript(s('t128PasswordHash'))),
         expect: '`HA_PEER_ACCESS_CLOSED`',
       },
       {
         title: 'Restart node0',
         text: 'node0 must restart to recognize node1.',
-        cmd: az(['vm', 'restart'], [rg, ['--name', vm0]]),
+        cmd: az(['vm', 'restart'], [rgOf(0), ['--name', vm0]]),
         expect: 'The command returns without error.',
       },
       {
         title: 'Verify the HA pair',
         text: 'Wait about 5 minutes, then check node0. Finally log in to the PCLI on either node (SSH as t128, then `sudo su - admin`) and run `show system connectivity`: both nodes must be connected.',
-        cmd: runCommand(vm0, STATUS_SCRIPT),
+        cmd: runCommand(0, STATUS_SCRIPT),
         expect: '`STATE=READY`, and global.init lists `node0` and `node1`.',
       },
     ];
@@ -570,7 +594,7 @@
 
   function rollbackCommand(values, node) {
     const s = (id) => resolve(values, id);
-    const rg = ['--resource-group', s('resourceGroup')];
+    const rg = ['--resource-group', nodeResourceGroup(values, node)];
     const vm = s(`node${node}VmName`);
     const cmds = [
       az(['vm', 'delete'], [rg, ['--name', vm], ['--yes']]),
@@ -642,15 +666,18 @@
     bus[LINK] = '╧';
     bus[width + GAP + LINK] = '╧';
 
-    const vnetRg = s('virtualNetworkResourceGroup');
+    const vnetRg = sharedResourceGroup(values, 'virtualNetworkResourceGroup', 1);
     const created = `VM, NIC, NSG${mode === 'create' ? ', public IP' : ''}`;
+    const rgText = separateResourceGroups(values)
+      ? `node0 in resource group ${nodeResourceGroup(values, 0)}, node1 in resource group ${nodeResourceGroup(values, 1)}`
+      : `Resource group ${s('resourceGroup')}`;
     const nsgRows = [
       ['routers', 'TCP 930, 933, 4505-4506', `from ${s('controlAllowedCidr')}`],
       ['admins', 'TCP 22, 443', `from ${s('adminAllowedCidr')}`],
       ['HA peer', 'all ports', 'from the other node\'s IP only (/32)'],
     ];
     return [
-      `Resource group ${s('resourceGroup')} (${s('location')}) - created per node: ${created}`,
+      `${rgText} (${s('location')}) - created per node: ${created}`,
       '',
       ...pair(vms[0], vms[1], gap),
       pair([link], [link])[0],
@@ -674,6 +701,9 @@
     const router = s('conductorName');
     const where = [placement(values, 0), placement(values, 1)];
     const whereText = where[0] || where[1] ? ` (${where.join(' / ')})` : '';
+    const rgDetail = separateResourceGroups(values)
+      ? ` node0 is in resource group ${c(nodeResourceGroup(values, 0))}, node1 in ${c(nodeResourceGroup(values, 1))}.`
+      : '';
     const pip = [publicIp(values, 0), publicIp(values, 1)];
     const pipNames = pip.map((p) => c(p.name)).join(' / ');
     const pipRg = s('publicIpResourceGroup');
@@ -691,7 +721,7 @@
       '',
       '| SSR term (inside the VM) | Azure resource (outside the VM) | Details |',
       '|---|---|---|',
-      `| Conductor router ${c(router)}, nodes ${c('node0')} / ${c('node1')} | VMs ${c(vm[0])} / ${c(vm[1])}${whereText} | One VM per node from the BYOL marketplace image, deployed from the same ARM template. Hostnames ${c(`${router}-node0`)} / ${c(`${router}-node1`)}. |`,
+      `| Conductor router ${c(router)}, nodes ${c('node0')} / ${c('node1')} | VMs ${c(vm[0])} / ${c(vm[1])}${whereText} | One VM per node from the BYOL marketplace image, deployed from the same ARM template.${rgDetail} Hostnames ${c(`${router}-node0`)} / ${c(`${router}-node1`)}. |`,
       `| Interface ${c('ge-0-0')} | NICs ${nic} | The only NIC on each VM, so SSR names it ${c('ge-0-0')} (NICs become ${c('ge-0-0')}, ${c('ge-0-1')}, ... in attach order). Tagged ${c('SSR-ROLE=MGMT')}; accelerated networking and IP forwarding enabled. |`,
       `| Node IP (${c('node-ip')}), the conductor address | Static private IPs ${c(ip[0])} / ${c(ip[1])} | The NIC IP (template ${c('controlPrivateIp')}) and the cloud-init ${c('node-ip')} are the same value. Managed routers connect to both addresses. |`,
       `| HA sync interface (node1 ${c('ha-peer-ip')} = ${c(ip[0])}) | Same NIC and IP; no HA sync NIC | Conductor-to-conductor sync runs over ${c('ge-0-0')} through the subnet. Hardware conductors use a dedicated HA sync NIC on ${c('169.254.253.x')} (${c('clustered')}), which an Azure VNet cannot carry. |`,
@@ -709,14 +739,18 @@
     const zone = (n) => s(`node${n}Zone`) || (s('availabilitySetName') ? `availability set ${s('availabilitySetName')}` : 'none');
     const pip = [publicIp(values, 0), publicIp(values, 1)];
     const pipNames = pip.map((p) => `\`${p.name}\``).join(' / ');
-    const pipRg = s('publicIpResourceGroup') || s('resourceGroup');
+    const split = separateResourceGroups(values);
+    const rg = [nodeResourceGroup(values, 0), nodeResourceGroup(values, 1)];
+    const pipWhere = s('publicIpResourceGroup')
+      ? `in resource group \`${s('publicIpResourceGroup')}\``
+      : (split ? 'in their node\'s resource group' : `in resource group \`${rg[0]}\``);
     const publicIpText = {
       none: 'no',
       create: `new, one per node (${pipNames})`,
-      existing: `existing, attached to node0 / node1: ${pipNames} in resource group \`${pipRg}\``,
+      existing: `existing, attached to node0 / node1: ${pipNames} ${pipWhere}`,
     }[pip[0].mode];
     const prereqPublicIp = pip[0].mode === 'existing'
-      ? [`- The existing public IPs ${pipNames} are in resource group \`${pipRg}\` and region \`${s('location')}\`, are Standard SKU with static allocation, are not attached to any other resource, and are zone-redundant or in their node's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on them.`]
+      ? [`- The existing public IPs ${pipNames} are ${pipWhere} and region \`${s('location')}\`, are Standard SKU with static allocation, are not attached to any other resource, and are zone-redundant or in their node's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on them.`]
       : [];
     const out = [
       `# MOP: Highly available SSR conductor in Azure${customer ? ` - ${customer}` : ''}`,
@@ -727,7 +761,7 @@
       '',
       '| Item | Value |',
       '|---|---|',
-      `| Resource group | \`${s('resourceGroup')}\` |`,
+      split ? `| Resource groups | node0 \`${rg[0]}\`, node1 \`${rg[1]}\` |` : `| Resource group | \`${rg[0]}\` |`,
       `| Region | \`${s('location')}\` |`,
       `| VNet / subnet | \`${s('virtualNetworkName')}\` / \`${s('controlSubnetName')}\` |`,
       `| node0 | VM \`${s('node0VmName')}\`, IP \`${s('node0PrivateIp')}\`, zone ${zone(0)} |`,
@@ -742,10 +776,10 @@
       '',
       '## Prerequisites',
       '',
-      '- The resource group, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.',
+      `- The resource group${split ? 's' : ''}, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.`,
       '- The subnet has outbound HTTPS access to download the SSR software, and allows traffic between the two nodes.',
       ...prereqPublicIp,
-      '- Azure Cloud Shell (PowerShell) with permission to deploy to the resource group and to run `az vm run-command`.',
+      `- Azure Cloud Shell (PowerShell) with permission to deploy to ${split ? 'both resource groups' : 'the resource group'} and to run \`az vm run-command\`.`,
       '- The five deployment files below, uploaded to one Cloud Shell directory (Manage files > Upload). Run every command from that directory.',
       '',
       '## Files',
@@ -814,6 +848,9 @@
     }
     if (v('availabilitySetName') && (v('node0Zone') || v('node1Zone'))) {
       fieldErrors.availabilitySetName = 'Availability set and availability zones are mutually exclusive; clear the node zones to use a set';
+    }
+    if (v('availabilitySetName') && v('node1ResourceGroup') && v('node1ResourceGroup').toLowerCase() !== v('resourceGroup').toLowerCase()) {
+      fieldErrors.node1ResourceGroup = 'An availability set needs both VMs in its resource group; clear this or the availability set';
     }
     if (v('node0Zone') && v('node0Zone') === v('node1Zone')) {
       warnings.push('node0 and node1 are in the same availability zone; use different zones for zone redundancy.');
@@ -1098,6 +1135,8 @@
     isActive,
     upgradeValues,
     resolve,
+    nodeResourceGroup,
+    separateResourceGroups,
     onboardingConfig,
     buildGeneratedFiles,
     buildAllFiles,

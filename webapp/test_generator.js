@@ -330,6 +330,55 @@ test('MOP commands are single lines with safe PowerShell quoting and valid shell
     ['--parameters', '@conductor-node0-params.json', 'customData=@conductor-node0-cloud-init.txt']);
 });
 
+test('node1 can use its own resource group', () => {
+  const rgArgs = (cmd) => {
+    const args = parsePowerShellArgs(cmd);
+    return args.flatMap((a, i) => (a === '--resource-group' ? [args[i + 1]] : []));
+  };
+  const params = (values, n) => JSON.parse(G.buildGeneratedFiles(values).find((f) => f.path === G.FILES[`p${n}`]).content).parameters;
+  const rollbackLines = (values) => G.mopDocument(values).split('## Rollback')[1].split('```powershell\n')[1].split('\n```')[0].split('\n');
+
+  const same = filled();
+  assert.ok(!G.separateResourceGroups(same));
+  assert.ok(!G.separateResourceGroups(Object.assign(filled(), { node1ResourceGroup: 'SSR-RG' })), 'resource group names are case-insensitive');
+  for (const step of G.mopSteps(same)) for (const rg of rgArgs(step.cmd)) assert.strictEqual(rg, 'ssr-rg');
+  assert.strictEqual(params(same, 1).virtualNetworkResourceGroup.value, '');
+
+  const split = Object.assign(filled(), { publicIpMode: 'create', node1ResourceGroup: 'ssr-rg-b' });
+  assert.deepStrictEqual(G.validate(split).fieldErrors, {});
+  const steps = G.mopSteps(split);
+  const byTitle = Object.fromEntries(steps.map((st) => [st.title, rgArgs(st.cmd)]));
+  assert.deepStrictEqual(byTitle['Deploy node0'], ['ssr-rg']);
+  assert.deepStrictEqual(byTitle['Wait until node0 is initialized'], ['ssr-rg']);
+  assert.deepStrictEqual(byTitle['Open temporary HA peer access on node0'], ['ssr-rg']);
+  assert.deepStrictEqual(byTitle['Deploy node1'], ['ssr-rg-b']);
+  assert.deepStrictEqual(byTitle['Wait until node1 has joined'], ['ssr-rg-b']);
+  assert.deepStrictEqual(byTitle['Close HA peer access on node0'], ['ssr-rg']);
+  assert.deepStrictEqual(byTitle['Restart node0'], ['ssr-rg']);
+  const [rb1, rb0] = rollbackLines(split);
+  assert.ok(rb1.includes("'conductor-node1'") && rb1.split('; ').every((c) => rgArgs(c)[0] === 'ssr-rg-b'), rb1);
+  assert.ok(rb0.includes("'conductor-node0'") && rb0.split('; ').every((c) => rgArgs(c)[0] === 'ssr-rg'), rb0);
+
+  // Shared resources (VNet, identity) default to node0's resource group, so node1's params name it explicitly.
+  assert.strictEqual(params(split, 0).virtualNetworkResourceGroup.value, '');
+  assert.strictEqual(params(split, 1).virtualNetworkResourceGroup.value, 'ssr-rg');
+  assert.strictEqual(params(split, 1).managedIdentityResourceGroup.value, 'ssr-rg');
+  const explicit = Object.assign(filled(), { node1ResourceGroup: 'ssr-rg-b', virtualNetworkResourceGroup: 'net-rg', managedIdentityResourceGroup: 'id-rg' });
+  for (const n of [0, 1]) {
+    assert.strictEqual(params(explicit, n).virtualNetworkResourceGroup.value, 'net-rg');
+    assert.strictEqual(params(explicit, n).managedIdentityResourceGroup.value, 'id-rg');
+  }
+
+  const mop = G.mopDocument(split);
+  assert.ok(mop.includes('| Resource groups | node0 `ssr-rg`, node1 `ssr-rg-b` |'));
+  assert.ok(mop.includes('permission to deploy to both resource groups'));
+  assert.ok(G.topologyDiagram(split).startsWith('node0 in resource group ssr-rg, node1 in resource group ssr-rg-b'));
+  assert.ok(G.topologyDiagram(split).includes('(existing, resource group ssr-rg)'), 'VNet location is explicit');
+
+  const avset = Object.assign(filled(), { node1ResourceGroup: 'ssr-rg-b', node0Zone: '', node1Zone: '', availabilitySetName: 'set' });
+  assert.ok(G.validate(avset).fieldErrors.node1ResourceGroup);
+});
+
 test('cross-field validation', () => {
   const values = filled();
   values.node1PrivateIp = values.node0PrivateIp;
