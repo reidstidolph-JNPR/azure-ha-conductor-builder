@@ -100,7 +100,21 @@
       "type": "bool",
       "defaultValue": false,
       "metadata": {
-        "description": "[OPTIONAL] Create and attach a static Standard SKU public IP to the control interface."
+        "description": "[OPTIONAL] Create and attach a static Standard SKU public IP to the control interface. Ignored when existingPublicIpName is set."
+      }
+    },
+    "existingPublicIpName": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "[OPTIONAL] Name of an existing public IP to attach to the control interface instead of creating one. Must be Standard SKU, static, in the same region, not associated with another resource, and zone-redundant or in this node's zone. Mutually exclusive with createPublicIp."
+      }
+    },
+    "existingPublicIpResourceGroup": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "[OPTIONAL] Resource group of existingPublicIpName. Defaults to the deployment resource group."
       }
     },
     "controlAllowedCidr": {
@@ -140,7 +154,11 @@
     "managementSubnetRef": "[resourceId(variables('vnetResourceGroup'), 'Microsoft.Network/virtualNetworks/subnets', parameters('virtualNetworkName'), parameters('controlSubnetName'))]",
     "managedIdentityRef": "[resourceId(variables('managedIdentityGroupName'), 'Microsoft.ManagedIdentity/userAssignedIdentities', parameters('managedIdentity'))]",
     "mgmtName": "[concat(parameters('instanceName'), '-control')]",
-    "publicIpRef": "[resourceId('Microsoft.Network/publicIPAddresses', concat(parameters('instanceName'), '-control'))]",
+    "useExistingPublicIp": "[not(empty(parameters('existingPublicIpName')))]",
+    "createNewPublicIp": "[and(parameters('createPublicIp'), not(variables('useExistingPublicIp')))]",
+    "attachPublicIp": "[or(variables('createNewPublicIp'), variables('useExistingPublicIp'))]",
+    "newPublicIpRef": "[resourceId('Microsoft.Network/publicIPAddresses', concat(parameters('instanceName'), '-control'))]",
+    "publicIpRef": "[if(variables('useExistingPublicIp'), resourceId(if(empty(parameters('existingPublicIpResourceGroup')), resourceGroup().name, parameters('existingPublicIpResourceGroup')), 'Microsoft.Network/publicIPAddresses', parameters('existingPublicIpName')), variables('newPublicIpRef'))]",
     "offer": "session-smart-networking-payg",
     "sku": "session-smart-networking-public-gen2-byol"
   },
@@ -253,7 +271,7 @@
       }
     },
     {
-      "condition": "[parameters('createPublicIp')]",
+      "condition": "[variables('createNewPublicIp')]",
       "apiVersion": "2019-09-01",
       "type": "Microsoft.Network/publicIPAddresses",
       "name": "[variables('mgmtName')]",
@@ -273,7 +291,7 @@
       "location": "[parameters('location')]",
       "dependsOn": [
         "[resourceId('Microsoft.Network/networkSecurityGroups/', variables('mgmtName'))]",
-        "[variables('publicIpRef')]"
+        "[variables('newPublicIpRef')]"
       ],
       "tags": {
         "SSR-ROLE": "MGMT"
@@ -290,7 +308,7 @@
             "properties": {
               "privateIPAllocationMethod": "Static",
               "privateIPAddress": "[parameters('controlPrivateIp')]",
-              "publicIPAddress": "[if(parameters('createPublicIp'), createObject('id', variables('publicIpRef')), json('null'))]",
+              "publicIPAddress": "[if(variables('attachPublicIp'), createObject('id', variables('publicIpRef')), json('null'))]",
               "subnet": {
                 "id": "[variables('managementSubnetRef')]"
               }
@@ -398,13 +416,13 @@
       "value": "[reference(resourceId('Microsoft.Network/networkInterfaces/', variables('mgmtName'))).ipConfigurations[0].properties.privateIPAddress]"
     },
     "publicIPAddress": {
-      "condition": "[parameters('createPublicIp')]",
+      "condition": "[variables('attachPublicIp')]",
       "type": "string",
-      "value": "[reference(variables('publicIpRef')).ipAddress]"
+      "value": "[reference(variables('publicIpRef'), '2019-09-01').ipAddress]"
     },
     "SSHLogin": {
       "type": "string",
-      "value": "[concat('ssh -i <ssh-key.pem> t128@', if(parameters('createPublicIp'), reference(variables('publicIpRef')).ipAddress, reference(resourceId('Microsoft.Network/networkInterfaces/', variables('mgmtName'))).ipConfigurations[0].properties.privateIPAddress))]"
+      "value": "[concat('ssh -i <ssh-key.pem> t128@', if(variables('attachPublicIp'), reference(variables('publicIpRef'), '2019-09-01').ipAddress, reference(resourceId('Microsoft.Network/networkInterfaces/', variables('mgmtName'))).ipConfigurations[0].properties.privateIPAddress))]"
     }
   }
 }

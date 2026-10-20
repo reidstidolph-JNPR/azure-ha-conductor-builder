@@ -15,6 +15,49 @@ This procedure deploys a two-node highly available Session Smart conductor (node
 | Conductor name | `Conductor` |
 | SSR version | `7.2.3` |
 
+## Network topology
+
+Each SSR conductor node is one Azure VM with a **single NIC** in the same existing subnet. Inside the VM, SSR sees that NIC as `ge-0-0`, and it carries both the conductor (control) traffic from managed routers and the HA sync between the two nodes. No separate HA sync or fabric NIC is deployed.
+
+```text
+Resource group <input-your-resource-group> (<input-your-azure-region>) - created per node: VM, NIC, NSG
+
+┌─ Azure VM conductor-node0 ───────────┐              ┌─ Azure VM conductor-node1 ───────────┐
+│ zone 1                               │              │ zone 2                               │
+│ SSR router Conductor, node0          │              │ SSR router Conductor, node1          │
+│ hostname Conductor-node0             │              │ hostname Conductor-node1             │
+│                                      │    HA sync   │                                      │
+│ ge-0-0  <input-node0-private-ip>     │<────────────>│ ge-0-0  <input-node1-private-ip>     │
+│   conductor address + HA sync        │              │   conductor address + HA sync        │
+└───┬──────────────────────────────────┘              └───┬──────────────────────────────────┘
+    │ NIC appears in the VM as ge-0-0                     │ NIC appears in the VM as ge-0-0
+┌───┴──────────────────────────────────┐              ┌───┴──────────────────────────────────┐
+│ NIC conductor-node0-control          │              │ NIC conductor-node1-control          │
+│   static IP <input-node0-private-ip> │              │   static IP <input-node1-private-ip> │
+│   tag SSR-ROLE=MGMT                  │              │   tag SSR-ROLE=MGMT                  │
+│ NSG conductor-node0-control          │              │ NSG conductor-node1-control          │
+│ no public IP                         │              │ no public IP                         │
+└───┬──────────────────────────────────┘              └───┬──────────────────────────────────┘
+════╧═════════════════════════════════════════════════════╧═══════════════════════════════════
+ Subnet <input-your-subnet-name> in VNet <input-your-vnet-name> (existing)
+ Inbound, allowed by each node's NSG:
+   routers  TCP 930, 933, 4505-4506  from 0.0.0.0/0
+   admins   TCP 22, 443              from 0.0.0.0/0
+   HA peer  all ports                from the other node's IP only (/32)
+ Outbound: HTTPS to the SSR software repository (install and upgrades)
+```
+
+| SSR term (inside the VM) | Azure resource (outside the VM) | Details |
+|---|---|---|
+| Conductor router `Conductor`, nodes `node0` / `node1` | VMs `conductor-node0` / `conductor-node1` (zone 1 / zone 2) | One VM per node from the BYOL marketplace image, deployed from the same ARM template. Hostnames `Conductor-node0` / `Conductor-node1`. |
+| Interface `ge-0-0` | NICs `conductor-node0-control` / `conductor-node1-control` | The only NIC on each VM, so SSR names it `ge-0-0` (NICs become `ge-0-0`, `ge-0-1`, ... in attach order). Tagged `SSR-ROLE=MGMT`; accelerated networking and IP forwarding enabled. |
+| Node IP (`node-ip`), the conductor address | Static private IPs `<input-node0-private-ip>` / `<input-node1-private-ip>` | The NIC IP (template `controlPrivateIp`) and the cloud-init `node-ip` are the same value. Managed routers connect to both addresses. |
+| HA sync interface (node1 `ha-peer-ip` = `<input-node0-private-ip>`) | Same NIC and IP; no HA sync NIC | Conductor-to-conductor sync runs over `ge-0-0` through the subnet. Hardware conductors use a dedicated HA sync NIC on `169.254.253.x` (`clustered`), which an Azure VNet cannot carry. |
+| HA fabric interface | None | Conductors do not forward session traffic, so there is no fabric link. |
+| - | NSGs `conductor-node0-control` / `conductor-node1-control`, one per NIC | Inbound allow: TCP 22, 443 from `0.0.0.0/0`; TCP 930 (router control), 933 (secure onboarding), 4505-4506 (salt) from `0.0.0.0/0`; all traffic from the HA peer's IP. |
+| - | No public IP | Routers and administrators reach the nodes on their private IPs (VNet peering, VPN or ExpressRoute). |
+| - | VNet `<input-your-vnet-name>`, subnet `<input-your-subnet-name>` | Existing, not created by the template. Needs outbound HTTPS for the SSR download and must allow traffic between the two nodes. |
+
 ## Prerequisites
 
 - The resource group, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.

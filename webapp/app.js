@@ -63,12 +63,14 @@
     const cells = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
     while (i < lines.length) {
       const line = lines[i];
-      if (/^```/.test(line)) {
+      const fence = /^```(\S*)/.exec(line);
+      if (fence) {
         const buf = [];
         i++;
         while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
         i++;
-        out.push(`<pre class="md-code">${escapeHtml(buf.join('\n'))}</pre>`);
+        // `text` blocks hold diagrams, which must keep their exact layout.
+        out.push(`<pre class="md-code${fence[1] === 'text' ? ' md-diagram' : ''}">${escapeHtml(buf.join('\n'))}</pre>`);
         continue;
       }
       const hm = /^(#{1,4})\s+(.*)$/.exec(line);
@@ -123,7 +125,9 @@
     const common = { id: `f-${f.id}`, name: f.id, oninput: onInput, onchange: onInput };
     if (f.kind === 'checkbox') return h('input', { ...common, type: 'checkbox' });
     if (f.kind === 'select') {
-      return h('select', common, f.options.map((o) => h('option', { value: o }, o === '' ? '(none)' : o)));
+      return h('select', common, f.options.map((o) => (typeof o === 'string'
+        ? h('option', { value: o }, o === '' ? '(none)' : o)
+        : h('option', { value: o.value }, o.label))));
     }
     if (f.kind === 'textarea') return h('textarea', { ...common, rows: 3, spellcheck: 'false', placeholder: f.ph || '' });
     const input = h('input', {
@@ -184,6 +188,7 @@
     for (const f of G.FIELDS) {
       const msg = fieldErrors[f.id] || '';
       $(`#e-${f.id}`).textContent = msg;
+      $(`#w-${f.id}`).hidden = !G.isActive(state.values, f.id);
       $(`#w-${f.id}`).classList.toggle('invalid', Boolean(msg));
       $(`#w-${f.id}`).classList.toggle('missing', missing.includes(f.id));
     }
@@ -405,7 +410,7 @@
     const file = e.target.files[0];
     if (!file) return;
     file.text().then((text) => {
-      const data = JSON.parse(text);
+      const data = G.upgradeValues(JSON.parse(text));
       for (const f of G.FIELDS) if (f.id in data) state.values[f.id] = data[f.id];
       writeValuesToForm();
     }).catch((err) => alert(`Unable to import: ${err.message}`)).finally(() => { e.target.value = ''; });

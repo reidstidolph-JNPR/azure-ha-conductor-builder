@@ -14,8 +14,6 @@ require('./generator.js');
 const G = globalThis.SsrHa;
 const BUNDLE_DIR = path.resolve(__dirname, '..');
 const README = path.join(BUNDLE_DIR, 'README.md');
-const TABLE_BEGIN = '<!-- INPUTS-TABLE:BEGIN -->';
-const TABLE_END = '<!-- INPUTS-TABLE:END -->';
 
 /* Markdown inputs reference for README.md, generated from the same FIELDS the web app uses. */
 function inputsTable() {
@@ -33,17 +31,26 @@ function inputsTable() {
       else if (f.def !== undefined) def = `\`${f.def}\``;
       const ph = f.required ? ` Placeholder: \`${f.ph}\`` : '';
       const used = f.usedIn.map((u) => `\`${cell(u)}\``).join('<br>');
-      out.push(`| ${n} | ${text(f.label)} | ${f.required ? 'Yes' : 'No'} | ${def} | ${text(f.help)}${ph} | ${used} |`);
+      const when = f.when ? ` (only when ${G.FIELD_BY_ID[f.when.field].label} = \`${f.when.equals}\`)` : '';
+      out.push(`| ${n} | ${text(f.label)} | ${f.required ? 'Yes' : 'No'}${when} | ${def} | ${text(f.help)}${ph} | ${used} |`);
     }
   }
   return `${out.join('\n')}\n`;
 }
 
-function readmeWithTable(readme) {
-  const start = readme.indexOf(TABLE_BEGIN);
-  const end = readme.indexOf(TABLE_END);
-  if (start < 0 || end < start) throw new Error('README.md is missing the INPUTS-TABLE markers');
-  return `${readme.slice(0, start + TABLE_BEGIN.length)}${inputsTable()}${readme.slice(end)}`;
+function replaceBlock(text, marker, content) {
+  const begin = `<!-- ${marker}:BEGIN -->`;
+  const end = `<!-- ${marker}:END -->`;
+  const start = text.indexOf(begin);
+  const stop = text.indexOf(end);
+  if (start < 0 || stop < start) throw new Error(`README.md is missing the ${marker} markers`);
+  return `${text.slice(0, start + begin.length)}${content}${text.slice(stop)}`;
+}
+
+/* README.md with its generated blocks (topology for placeholder inputs, inputs table) refreshed. */
+function readmeWithGenerated(readme) {
+  const topology = `\n${G.topologyMarkdown(G.defaults())}\n`;
+  return replaceBlock(replaceBlock(readme, 'TOPOLOGY', topology), 'INPUTS-TABLE', inputsTable());
 }
 
 if (process.argv.includes('--write')) {
@@ -51,8 +58,8 @@ if (process.argv.includes('--write')) {
     fs.writeFileSync(path.join(BUNDLE_DIR, f.path), f.content);
     console.log(`wrote ${f.path}`);
   }
-  fs.writeFileSync(README, readmeWithTable(fs.readFileSync(README, 'utf8')));
-  console.log('updated README.md inputs table');
+  fs.writeFileSync(README, readmeWithGenerated(fs.readFileSync(README, 'utf8')));
+  console.log('updated README.md topology and inputs table');
   process.exit(0);
 }
 
@@ -88,10 +95,53 @@ test('sample files on disk match generator output for empty inputs', () => {
   }
 });
 
-test('README inputs table matches the field definitions', () => {
+test('README topology and inputs table match the generator', () => {
   const readme = fs.readFileSync(README, 'utf8');
-  assert.strictEqual(readme, readmeWithTable(readme), 'README.md inputs table is stale; run: node test_generator.js --write');
+  assert.strictEqual(readme, readmeWithGenerated(readme), 'README.md generated blocks are stale; run: node test_generator.js --write');
   for (const f of G.FIELDS) assert.ok(readme.includes(`| ${f.label.replace(/</g, '&lt;')} |`), f.label);
+  assert.ok(readme.indexOf('## What gets built') < readme.indexOf('## Hand-off bundle'), 'topology is shown up front');
+});
+
+test('topology diagram is aligned and reflects the inputs', () => {
+  const variants = [
+    G.defaults(),
+    filled(),
+    Object.assign(filled(), { publicIpMode: 'create', node0Zone: '', node1Zone: '', availabilitySetName: 'cond-avset', node0VmName: 'a-much-longer-conductor-vm-name-0' }),
+    Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip-a', node1PublicIpName: 'pip-b' }),
+    Object.assign(G.defaults(), { publicIpMode: 'existing' }),
+  ];
+  for (const values of variants) {
+    const lines = G.topologyDiagram(values).split('\n');
+    const boxes = lines.filter((l) => /^[┌│└]/.test(l));
+    const bus = lines.find((l) => l.startsWith('═'));
+    assert.ok(bus, 'subnet line present');
+    for (const l of boxes) assert.strictEqual(l.length, bus.length, `misaligned row: ${l}`);
+    for (const ch of ['┬', '┴']) {
+      const cols = boxes.filter((l) => l.includes(ch)).map((l) => [l.indexOf(ch), l.lastIndexOf(ch)].join());
+      assert.ok(cols.every((c) => c === [bus.indexOf('╧'), bus.lastIndexOf('╧')].join()), `${ch} connectors line up with the subnet`);
+    }
+    const ha = boxes.find((l) => l.includes('<──'));
+    assert.ok(ha && ha.split('ge-0-0').length === 3, 'HA sync link joins both ge-0-0 rows');
+    for (const n of [0, 1]) {
+      const vm = G.resolve(values, `node${n}VmName`);
+      for (const want of [`Azure VM ${vm}`, `NIC ${vm}-control`, `NSG ${vm}-control`, `ge-0-0  ${G.resolve(values, `node${n}PrivateIp`)}`]) {
+        assert.ok(lines.some((l) => l.includes(want)), want);
+      }
+    }
+    const mode = values.publicIpMode;
+    assert.strictEqual(lines.some((l) => l.includes('public IP (new)')), mode === 'create');
+    assert.strictEqual(lines.some((l) => l.includes('public IP (existing)')), mode === 'existing');
+    assert.strictEqual(lines.some((l) => l.includes('no public IP')), mode === 'none');
+    if (mode !== 'none') {
+      for (const n of [0, 1]) {
+        const name = mode === 'create' ? `${G.resolve(values, `node${n}VmName`)}-control` : G.resolve(values, `node${n}PublicIpName`);
+        assert.ok(lines.some((l) => l.includes(`  ${name}`)), name);
+      }
+    }
+  }
+  const mop = G.mopDocument(filled());
+  assert.ok(mop.indexOf('## Network topology') > mop.indexOf('## Environment') && mop.indexOf('## Network topology') < mop.indexOf('## Procedure'));
+  assert.ok(mop.includes(`\`\`\`text\n${G.topologyDiagram(filled())}\n\`\`\``));
 });
 
 test('sha512 matches node crypto', () => {
@@ -161,6 +211,61 @@ test('node0/node1 onboarding configs carry the HA settings', () => {
   assert.strictEqual(params0.availabilityZone.value, '1');
   assert.strictEqual(params1.availabilityZone.value, '2');
   assert.strictEqual(params0.createPublicIp.value, false);
+  assert.strictEqual(params0.existingPublicIpName.value, '');
+  assert.strictEqual(params0.existingPublicIpResourceGroup.value, '');
+});
+
+test('public IP modes: none, create new, attach existing', () => {
+  const params = (values, n) => JSON.parse(G.buildGeneratedFiles(values).find((f) => f.path === G.FILES[`p${n}`]).content).parameters;
+  const rollback = (values) => G.mopDocument(values).split('## Rollback')[1].split('## Troubleshooting')[0];
+
+  const created = Object.assign(filled(), { publicIpMode: 'create', node0PublicIpName: 'ignored', publicIpResourceGroup: 'ignored-rg' });
+  assert.deepStrictEqual(G.validate(created).fieldErrors, {});
+  for (const n of [0, 1]) {
+    const p = params(created, n);
+    assert.strictEqual(p.createPublicIp.value, true);
+    assert.strictEqual(p.existingPublicIpName.value, '', 'inactive existing-IP inputs are not written');
+    assert.strictEqual(p.existingPublicIpResourceGroup.value, '');
+  }
+  assert.ok(rollback(created).includes("az network public-ip delete --resource-group 'ssr-rg' --name 'conductor-node0-control'"));
+
+  const existing = Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip-a', node1PublicIpName: 'pip-b', publicIpResourceGroup: 'pip-rg' });
+  assert.deepStrictEqual(G.validate(existing).fieldErrors, {});
+  assert.deepStrictEqual(G.validate(existing).missing, []);
+  ['pip-a', 'pip-b'].forEach((name, n) => {
+    const p = params(existing, n);
+    assert.strictEqual(p.createPublicIp.value, false);
+    assert.strictEqual(p.existingPublicIpName.value, name);
+    assert.strictEqual(p.existingPublicIpResourceGroup.value, 'pip-rg');
+  });
+  const mop = G.mopDocument(existing);
+  assert.ok(mop.includes('| Public IPs | existing, attached to node0 / node1: `pip-a` / `pip-b` in resource group `pip-rg` |'));
+  assert.ok(mop.includes('- The existing public IPs `pip-a` / `pip-b` are in resource group `pip-rg`'));
+  assert.ok(!rollback(existing).includes('public-ip delete'), 'existing public IPs are never deleted');
+  assert.ok(rollback(existing).includes('are kept'));
+
+  const empty = Object.assign(filled(), { publicIpMode: 'existing' });
+  assert.deepStrictEqual(G.validate(empty).missing, ['node0PublicIpName', 'node1PublicIpName']);
+  assert.strictEqual(params(empty, 1).existingPublicIpName.value, '<input-node1-existing-public-ip-name>');
+  const dup = Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip-a', node1PublicIpName: 'pip-a' });
+  assert.ok(G.validate(dup).fieldErrors.node1PublicIpName);
+  assert.deepStrictEqual(G.validate(Object.assign(filled(), { node0PublicIpName: 'not valid!' })).fieldErrors, {}, 'inactive fields are not validated');
+
+  assert.strictEqual(G.upgradeValues({ createPublicIp: true }).publicIpMode, 'create');
+  assert.strictEqual(G.upgradeValues({ createPublicIp: false }).publicIpMode, 'none');
+  assert.ok(!('createPublicIp' in G.upgradeValues({ createPublicIp: true })));
+});
+
+test('template wires new and existing public IPs', () => {
+  const t = JSON.parse(fs.readFileSync(path.join(BUNDLE_DIR, 'conductor_template.json'), 'utf8'));
+  const pip = t.resources.find((r) => r.type === 'Microsoft.Network/publicIPAddresses');
+  const nic = t.resources.find((r) => r.type === 'Microsoft.Network/networkInterfaces');
+  assert.strictEqual(pip.condition, "[variables('createNewPublicIp')]");
+  assert.ok(nic.dependsOn.includes("[variables('newPublicIpRef')]"), 'NIC may only depend on the template-created public IP');
+  assert.ok(nic.properties.ipConfigurations[0].properties.publicIPAddress.includes("variables('attachPublicIp')"));
+  for (const v of ['useExistingPublicIp', 'createNewPublicIp', 'attachPublicIp', 'newPublicIpRef', 'publicIpRef']) assert.ok(v in t.variables, v);
+  assert.strictEqual(t.outputs.publicIPAddress.condition, "[variables('attachPublicIp')]");
+  for (const o of [t.outputs.publicIPAddress.value, t.outputs.SSHLogin.value]) assert.ok(o.includes("reference(variables('publicIpRef'), '2019-09-01')"));
 });
 
 test('params files only use parameters defined in the template', () => {

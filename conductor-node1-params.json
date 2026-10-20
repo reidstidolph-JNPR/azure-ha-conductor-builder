@@ -41,6 +41,12 @@
     "createPublicIp": {
       "value": false
     },
+    "existingPublicIpName": {
+      "value": ""
+    },
+    "existingPublicIpResourceGroup": {
+      "value": ""
+    },
     "controlAllowedCidr": {
       "value": "0.0.0.0/0"
     },

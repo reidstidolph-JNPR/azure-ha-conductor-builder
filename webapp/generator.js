@@ -32,7 +32,9 @@
   ];
 
   /* kind: text | textarea | select | checkbox | secret | hash
-   * ph: placeholder written into files when a required value is empty */
+   * ph: placeholder written into files when a required value is empty
+   * when: { field, equals } - the field only applies (and is only required) when another field has that value
+   * select options: strings, or { value, label } */
   const FIELDS = [
     {
       id: 'resourceGroup', section: 'azure', label: 'Resource group', kind: 'text', required: true,
@@ -94,9 +96,21 @@
       validate: re(AZ_NAME, 'Not a valid availability set name'),
     },
     {
-      id: 'createPublicIp', section: 'azure', label: 'Create a public IP per node', kind: 'checkbox', def: false,
-      help: 'Attach a static Standard SKU public IP to each control interface (needed when routers reach the conductor over the Internet).',
-      usedIn: [`${F.p0}: createPublicIp`, `${F.p1}: createPublicIp`],
+      id: 'publicIpMode', section: 'azure', label: 'Public IP per node', kind: 'select', def: 'none',
+      options: [
+        { value: 'none', label: 'None (private IPs only)' },
+        { value: 'create', label: 'Create a new public IP per node' },
+        { value: 'existing', label: 'Attach an existing public IP per node' },
+      ],
+      help: 'Public IP on each control interface, needed when routers reach the conductor over the Internet. "Create" adds a static Standard SKU public IP named <VM name>-control; "Attach existing" uses public IPs you already own (for example, addresses already allow-listed by routers).',
+      usedIn: [`${F.p0}: createPublicIp, existingPublicIpName`, `${F.p1}: createPublicIp, existingPublicIpName`],
+    },
+    {
+      id: 'publicIpResourceGroup', section: 'azure', label: 'Existing public IP resource group', kind: 'text', def: '',
+      when: { field: 'publicIpMode', equals: 'existing' },
+      help: 'Only needed when the existing public IPs live in a different resource group. Empty = deployment resource group.',
+      usedIn: [`${F.p0}: existingPublicIpResourceGroup`, `${F.p1}: existingPublicIpResourceGroup`],
+      validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
     {
       id: 'adminAllowedCidr', section: 'azure', label: 'Admin allowed CIDR', kind: 'text', def: '0.0.0.0/0',
@@ -138,6 +152,14 @@
       usedIn: [`${F.p0}: availabilityZone`],
     },
     {
+      id: 'node0PublicIpName', section: 'nodes', label: 'node0 existing public IP name', kind: 'text', required: true,
+      when: { field: 'publicIpMode', equals: 'existing' },
+      ph: '<input-node0-existing-public-ip-name>',
+      help: 'Existing public IP for node0: Standard SKU, static, same region, not attached to anything else, and zone-redundant or in node0\'s zone.',
+      usedIn: [`${F.p0}: existingPublicIpName`],
+      validate: re(AZ_NAME, 'Not a valid public IP name'),
+    },
+    {
       id: 'node1VmName', section: 'nodes', label: 'node1 VM name', kind: 'text', def: 'conductor-node1',
       help: 'Azure VM name of the secondary node.',
       usedIn: [`${F.p1}: instanceName`, `${F.mop}: --name of node1 az vm commands`],
@@ -155,6 +177,14 @@
       options: ['', '1', '2', '3'],
       help: 'Zone of node1. Use a different zone than node0.',
       usedIn: [`${F.p1}: availabilityZone`],
+    },
+    {
+      id: 'node1PublicIpName', section: 'nodes', label: 'node1 existing public IP name', kind: 'text', required: true,
+      when: { field: 'publicIpMode', equals: 'existing' },
+      ph: '<input-node1-existing-public-ip-name>',
+      help: 'Existing public IP for node1, with the same requirements as node0\'s. Must differ from node0\'s.',
+      usedIn: [`${F.p1}: existingPublicIpName`],
+      validate: re(AZ_NAME, 'Not a valid public IP name'),
     },
 
     {
@@ -255,14 +285,36 @@
     return values;
   }
 
-  /* Value used in generated files: trimmed input, or the placeholder for empty required fields. */
+  function isActive(values, id) {
+    const w = FIELD_BY_ID[id].when;
+    return !w || values[w.field] === w.equals;
+  }
+
+  /* Maps inputs saved by earlier versions onto the current fields. */
+  function upgradeValues(data) {
+    const out = { ...data };
+    if ('createPublicIp' in out && !('publicIpMode' in out)) out.publicIpMode = out.createPublicIp ? 'create' : 'none';
+    delete out.createPublicIp;
+    return out;
+  }
+
+  /* Value used in generated files: trimmed input, or the placeholder for empty required fields; '' for inactive fields. */
   function resolve(values, id) {
     const f = FIELD_BY_ID[id];
     const raw = values[id];
     if (f.kind === 'checkbox') return Boolean(raw);
+    if (!isActive(values, id)) return '';
     const v = f.kind === 'secret' ? String(raw ?? '') : String(raw ?? '').trim();
     if (v === '' && f.required) return f.ph;
     return v;
+  }
+
+  /* Public IP of a node: mode none | create | existing, and the public IP resource name. */
+  function publicIp(values, node) {
+    const mode = resolve(values, 'publicIpMode');
+    if (mode === 'create') return { mode, name: `${resolve(values, `node${node}VmName`)}-control` };
+    if (mode === 'existing') return { mode, name: resolve(values, `node${node}PublicIpName`) };
+    return { mode: 'none', name: '' };
   }
 
   function onboardingConfig(values, node) {
@@ -346,7 +398,9 @@
         controlSubnetName: p(s('controlSubnetName')),
         controlPrivateIp: p(s(`${self}PrivateIp`)),
         haPeerPrivateIp: p(s(`${peer}PrivateIp`)),
-        createPublicIp: p(s('createPublicIp')),
+        createPublicIp: p(publicIp(values, node).mode === 'create'),
+        existingPublicIpName: p(publicIp(values, node).mode === 'existing' ? publicIp(values, node).name : ''),
+        existingPublicIpResourceGroup: p(s('publicIpResourceGroup')),
         controlAllowedCidr: p(s('controlAllowedCidr')),
         adminAllowedCidr: p(s('adminAllowedCidr')),
         adminPublicKeyData: p(s('adminPublicKeyData')),
@@ -524,8 +578,128 @@
       az(['network', 'nsg', 'delete'], [rg, ['--name', `${vm}-control`]]),
       az(['disk', 'delete'], [rg, ['--name', vm], ['--yes']]),
     ];
-    if (s('createPublicIp')) cmds.push(az(['network', 'public-ip', 'delete'], [rg, ['--name', `${vm}-control`]]));
+    if (publicIp(values, node).mode === 'create') cmds.push(az(['network', 'public-ip', 'delete'], [rg, ['--name', `${vm}-control`]]));
     return cmds.join('; ');
+  }
+
+  /* ---------- Network topology (README "What gets built" and MOP) ---------- */
+  function placement(values, node) {
+    const zone = resolve(values, `node${node}Zone`);
+    if (zone) return `zone ${zone}`;
+    const set = resolve(values, 'availabilitySetName');
+    return set ? `availability set ${set}` : '';
+  }
+
+  /* Box drawn with `width` total columns; `up`/`down` put a connector on the top/bottom border at that column. */
+  function diagramBox(title, lines, width, { up = -1, down = -1 } = {}) {
+    const border = (left, right, joint, pos, label) => {
+      const fill = (label ? `─ ${label} ` : '').padEnd(width - 2, '─').split('');
+      if (pos > 0) fill[pos - 1] = joint;
+      return `${left}${fill.join('')}${right}`;
+    };
+    return [
+      border('┌', '┐', '┴', up, title),
+      ...lines.map((l) => `│ ${l.padEnd(width - 4)} │`),
+      border('└', '┘', '┬', down, ''),
+    ];
+  }
+
+  /* Monospace (box-drawing) diagram of both nodes: Azure VM + NIC + NSG outside, SSR node and ge-0-0 inside. */
+  function topologyDiagram(values) {
+    const s = (id) => resolve(values, id);
+    const mode = publicIp(values, 0).mode;
+    const router = s('conductorName');
+    const cols = [0, 1].map((n) => {
+      const vm = s(`node${n}VmName`);
+      const ip = s(`node${n}PrivateIp`);
+      const where = placement(values, n);
+      const pip = mode === 'none' ? ['no public IP'] : [`public IP (${mode === 'create' ? 'new' : 'existing'})`, `  ${publicIp(values, n).name}`];
+      return {
+        title: `Azure VM ${vm}`,
+        ssr: [where || 'no zone or availability set', `SSR router ${router}, node${n}`, `hostname ${router}-node${n}`, '', `ge-0-0  ${ip}`, '  conductor address + HA sync'],
+        nic: [`NIC ${vm}-control`, `  static IP ${ip}`, '  tag SSR-ROLE=MGMT', `NSG ${vm}-control`, ...pip],
+      };
+    });
+    const LINK = 4;
+    const GAP = 14;
+    const linkLabel = ' NIC appears in the VM as ge-0-0';
+    const width = Math.max(
+      ...cols.flatMap((c) => [c.title.length + 6, ...[...c.ssr, ...c.nic].map((l) => l.length + 4)]),
+      LINK + 1 + linkLabel.length,
+    );
+    const total = width * 2 + GAP;
+    const haRow = 1 + cols[0].ssr.indexOf('');
+    const gap = (i) => {
+      if (i === haRow) return 'HA sync'.padStart(11).padEnd(GAP);
+      if (i === haRow + 1) return `<${'─'.repeat(GAP - 2)}>`;
+      return ' '.repeat(GAP);
+    };
+    const pair = (a, b, g = () => ' '.repeat(GAP)) => a.map((l, i) => `${l}${g(i)}${b[i]}`.trimEnd());
+    const vms = cols.map((c) => diagramBox(c.title, c.ssr, width, { down: LINK }));
+    const nics = cols.map((c) => diagramBox('', c.nic, width, { up: LINK, down: LINK }));
+    const link = `${' '.repeat(LINK)}│${linkLabel}`.padEnd(width);
+    const bus = '═'.repeat(total).split('');
+    bus[LINK] = '╧';
+    bus[width + GAP + LINK] = '╧';
+
+    const vnetRg = s('virtualNetworkResourceGroup');
+    const created = `VM, NIC, NSG${mode === 'create' ? ', public IP' : ''}`;
+    const nsgRows = [
+      ['routers', 'TCP 930, 933, 4505-4506', `from ${s('controlAllowedCidr')}`],
+      ['admins', 'TCP 22, 443', `from ${s('adminAllowedCidr')}`],
+      ['HA peer', 'all ports', 'from the other node\'s IP only (/32)'],
+    ];
+    return [
+      `Resource group ${s('resourceGroup')} (${s('location')}) - created per node: ${created}`,
+      '',
+      ...pair(vms[0], vms[1], gap),
+      pair([link], [link])[0],
+      ...pair(nics[0], nics[1]),
+      bus.join(''),
+      ` Subnet ${s('controlSubnetName')} in VNet ${s('virtualNetworkName')} (existing${vnetRg ? `, resource group ${vnetRg}` : ''})`,
+      ` Inbound, allowed by each node's NSG${mode === 'none' ? '' : ' (private and public IP)'}:`,
+      ...nsgRows.map(([who, ports, from]) => `   ${who.padEnd(9)}${ports.padEnd(25)}${from}`),
+      ' Outbound: HTTPS to the SSR software repository (install and upgrades)',
+    ].join('\n');
+  }
+
+  /* Diagram plus a table mapping each SSR (inside the VM) term to its Azure (outside the VM) resource. */
+  function topologyMarkdown(values) {
+    const s = (id) => resolve(values, id);
+    const FENCE = '```';
+    const c = (x) => `\`${x}\``;
+    const vm = [s('node0VmName'), s('node1VmName')];
+    const ip = [s('node0PrivateIp'), s('node1PrivateIp')];
+    const nic = vm.map((v) => c(`${v}-control`)).join(' / ');
+    const router = s('conductorName');
+    const where = [placement(values, 0), placement(values, 1)];
+    const whereText = where[0] || where[1] ? ` (${where.join(' / ')})` : '';
+    const pip = [publicIp(values, 0), publicIp(values, 1)];
+    const pipNames = pip.map((p) => c(p.name)).join(' / ');
+    const pipRg = s('publicIpResourceGroup');
+    const publicIpRow = {
+      none: ['No public IP', 'Routers and administrators reach the nodes on their private IPs (VNet peering, VPN or ExpressRoute).'],
+      create: [`New public IPs ${pipNames}`, 'Created by the template: Standard SKU, static, in the node\'s zone, one per NIC. Use them when routers or administrators reach the conductor over the Internet; the NSG rules apply to them too.'],
+      existing: [`Existing public IPs ${pipNames}${pipRg ? ` (resource group ${c(pipRg)})` : ''}`, 'Already created; the template only attaches them to the NICs, and the MOP rollback does not delete them. Use them when routers or administrators reach the conductor over the Internet; the NSG rules apply to them too.'],
+    }[pip[0].mode];
+    return [
+      'Each SSR conductor node is one Azure VM with a **single NIC** in the same existing subnet. Inside the VM, SSR sees that NIC as `ge-0-0`, and it carries both the conductor (control) traffic from managed routers and the HA sync between the two nodes. No separate HA sync or fabric NIC is deployed.',
+      '',
+      `${FENCE}text`,
+      topologyDiagram(values),
+      FENCE,
+      '',
+      '| SSR term (inside the VM) | Azure resource (outside the VM) | Details |',
+      '|---|---|---|',
+      `| Conductor router ${c(router)}, nodes ${c('node0')} / ${c('node1')} | VMs ${c(vm[0])} / ${c(vm[1])}${whereText} | One VM per node from the BYOL marketplace image, deployed from the same ARM template. Hostnames ${c(`${router}-node0`)} / ${c(`${router}-node1`)}. |`,
+      `| Interface ${c('ge-0-0')} | NICs ${nic} | The only NIC on each VM, so SSR names it ${c('ge-0-0')} (NICs become ${c('ge-0-0')}, ${c('ge-0-1')}, ... in attach order). Tagged ${c('SSR-ROLE=MGMT')}; accelerated networking and IP forwarding enabled. |`,
+      `| Node IP (${c('node-ip')}), the conductor address | Static private IPs ${c(ip[0])} / ${c(ip[1])} | The NIC IP (template ${c('controlPrivateIp')}) and the cloud-init ${c('node-ip')} are the same value. Managed routers connect to both addresses. |`,
+      `| HA sync interface (node1 ${c('ha-peer-ip')} = ${c(ip[0])}) | Same NIC and IP; no HA sync NIC | Conductor-to-conductor sync runs over ${c('ge-0-0')} through the subnet. Hardware conductors use a dedicated HA sync NIC on ${c('169.254.253.x')} (${c('clustered')}), which an Azure VNet cannot carry. |`,
+      `| HA fabric interface | None | Conductors do not forward session traffic, so there is no fabric link. |`,
+      `| - | NSGs ${nic}, one per NIC | Inbound allow: TCP 22, 443 from ${c(s('adminAllowedCidr'))}; TCP 930 (router control), 933 (secure onboarding), 4505-4506 (salt) from ${c(s('controlAllowedCidr'))}; all traffic from the HA peer's IP. |`,
+      `| - | ${publicIpRow[0]} | ${publicIpRow[1]} |`,
+      `| - | VNet ${c(s('virtualNetworkName'))}, subnet ${c(s('controlSubnetName'))} | Existing, not created by the template. Needs outbound HTTPS for the SSR download and must allow traffic between the two nodes. |`,
+    ].join('\n');
   }
 
   function mopDocument(values) {
@@ -533,6 +707,17 @@
     const FENCE = '```';
     const customer = s('mopCustomer');
     const zone = (n) => s(`node${n}Zone`) || (s('availabilitySetName') ? `availability set ${s('availabilitySetName')}` : 'none');
+    const pip = [publicIp(values, 0), publicIp(values, 1)];
+    const pipNames = pip.map((p) => `\`${p.name}\``).join(' / ');
+    const pipRg = s('publicIpResourceGroup') || s('resourceGroup');
+    const publicIpText = {
+      none: 'no',
+      create: `new, one per node (${pipNames})`,
+      existing: `existing, attached to node0 / node1: ${pipNames} in resource group \`${pipRg}\``,
+    }[pip[0].mode];
+    const prereqPublicIp = pip[0].mode === 'existing'
+      ? [`- The existing public IPs ${pipNames} are in resource group \`${pipRg}\` and region \`${s('location')}\`, are Standard SKU with static allocation, are not attached to any other resource, and are zone-redundant or in their node's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on them.`]
+      : [];
     const out = [
       `# MOP: Highly available SSR conductor in Azure${customer ? ` - ${customer}` : ''}`,
       '',
@@ -547,14 +732,19 @@
       `| VNet / subnet | \`${s('virtualNetworkName')}\` / \`${s('controlSubnetName')}\` |`,
       `| node0 | VM \`${s('node0VmName')}\`, IP \`${s('node0PrivateIp')}\`, zone ${zone(0)} |`,
       `| node1 | VM \`${s('node1VmName')}\`, IP \`${s('node1PrivateIp')}\`, zone ${zone(1)} |`,
-      `| Public IPs | ${s('createPublicIp') ? 'yes (one per node)' : 'no'} |`,
+      `| Public IPs | ${publicIpText} |`,
       `| Conductor name | \`${s('conductorName')}\` |`,
       `| SSR version | \`${s('ssrVersion')}\` |`,
+      '',
+      '## Network topology',
+      '',
+      topologyMarkdown(values),
       '',
       '## Prerequisites',
       '',
       '- The resource group, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.',
       '- The subnet has outbound HTTPS access to download the SSR software, and allows traffic between the two nodes.',
+      ...prereqPublicIp,
       '- Azure Cloud Shell (PowerShell) with permission to deploy to the resource group and to run `az vm run-command`.',
       '- The five deployment files below, uploaded to one Cloud Shell directory (Manage files > Upload). Run every command from that directory.',
       '',
@@ -579,7 +769,8 @@
       '',
       '## Rollback',
       '',
-      'To remove a node (for example to retry it), delete its resources. Re-run the procedure from that node\'s deploy step. If node1 is removed after it joined, also remove it from node0 before redeploying.',
+      'To remove a node (for example to retry it), delete its resources. Re-run the procedure from that node\'s deploy step. If node1 is removed after it joined, also remove it from node0 before redeploying.' +
+        (pip[0].mode === 'existing' ? ' The existing public IPs are detached when the NIC is deleted and are kept for the redeploy.' : ''),
       '',
       `${FENCE}powershell`,
       rollbackCommand(values, 1),
@@ -605,7 +796,7 @@
     const missing = [];
     const warnings = [];
     for (const f of FIELDS) {
-      if (f.kind === 'checkbox' || f.kind === 'select') continue;
+      if (f.kind === 'checkbox' || f.kind === 'select' || !isActive(values, f.id)) continue;
       const v = f.kind === 'secret' ? String(values[f.id] ?? '') : String(values[f.id] ?? '').trim();
       if (v === '') {
         if (f.required) missing.push(f.id);
@@ -630,8 +821,11 @@
     if (!v('availabilitySetName') && !v('node0Zone') && !v('node1Zone')) {
       warnings.push('No availability zones or availability set selected: the nodes have no placement redundancy.');
     }
-    if (v('adminAllowedCidr') === '0.0.0.0/0' && values.createPublicIp) {
+    if (v('adminAllowedCidr') === '0.0.0.0/0' && v('publicIpMode') !== 'none') {
       warnings.push('SSH/HTTPS is open to the Internet (admin CIDR 0.0.0.0/0 with public IPs). Consider restricting it.');
+    }
+    if (v('publicIpMode') === 'existing' && v('node0PublicIpName') && v('node0PublicIpName') === v('node1PublicIpName')) {
+      fieldErrors.node1PublicIpName = 'node0 and node1 need different public IPs';
     }
     const hashes = ['adminPasswordHash', 'rootPasswordHash', 't128PasswordHash'].map(v).filter(Boolean);
     if (hashes.length === 3 && new Set(hashes).size === 1) {
@@ -901,12 +1095,16 @@
     FIELDS,
     FIELD_BY_ID,
     defaults,
+    isActive,
+    upgradeValues,
     resolve,
     onboardingConfig,
     buildGeneratedFiles,
     buildAllFiles,
     mopSteps,
     mopDocument,
+    topologyDiagram,
+    topologyMarkdown,
     validate,
     makeZip,
     crc32,
