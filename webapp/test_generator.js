@@ -306,28 +306,94 @@ function parsePowerShellArgs(line) {
   return args;
 }
 
-test('MOP commands are single lines with safe PowerShell quoting and valid shell scripts', () => {
+/* Body of a `bash -euo pipefail <<'DELIM'` block as the inner bash receives it (the quoted here-document is not expanded). */
+function heredocBody(block) {
+  const lines = block.split('\n');
+  const m = /^bash -euo pipefail <<'([A-Z_]+)'$/.exec(lines[0]);
+  assert.ok(m, `not a quoted here-document: ${lines[0]}`);
+  assert.strictEqual(lines[lines.length - 1], m[1], 'here-document is not terminated on the last line');
+  assert.strictEqual(lines.slice(1, -1).indexOf(m[1]), -1, 'delimiter appears inside the body');
+  return lines.slice(1, -1).join('\n');
+}
+
+test('MOP steps: Cloud Shell only for Azure, node steps are valid bash, secrets survive quoting', () => {
   const values = filled();
-  values.haPeerPassword = `Tricky 'quote' "dq" $HOME \`back\` ;|&`;
+  values.haPeerPassword = `Tricky 'quote' "dq" $HOME \`back\` ;|& HA_PEER_OPEN`;
   const steps = G.mopSteps(values);
-  assert.strictEqual(steps.length, 10);
+  assert.deepStrictEqual(steps.map((st) => st.where), [
+    'cloudshell', 'cloudshell', 'cloudshell', 'terminal', 'node0', 'pcli0', 'pcli0', 'node0',
+    'cloudshell', 'terminal', 'node1', 'node0', 'node0', 'node0', 'pcli0', 'pcli0', 'pcli0']);
   for (const step of steps) {
-    assert.ok(!step.cmd.includes('\n'), `${step.title} is not a single line`);
-    const args = parsePowerShellArgs(step.cmd);
-    assert.strictEqual(args[0], 'az');
-    const i = args.indexOf('--scripts');
-    if (i > 0) execFileSync('bash', ['-n', '-c', args[i + 1]]);
+    assert.ok(G.WHERE[step.where], step.title);
+    assert.ok(!/\{\{step:/.test(step.text + step.expect), `unresolved step reference in ${step.title}`);
+    if (step.where === 'cloudshell') {
+      for (const line of step.cmd.split('\n')) assert.strictEqual(parsePowerShellArgs(line)[0], 'az', `${step.title}: one az command per line`);
+    } else if (step.where === 'pcli0') {
+      for (const line of step.cmd.split('\n')) assert.match(line, /^(config authority |commit force$|show (assets|system connectivity)$|exit$)/, `${step.title}: ${line}`);
+      assert.ok(step.text.includes('su - admin') || step.text.startsWith('Still in the node0 PCLI'), `${step.title} says how to get into the PCLI`);
+    } else {
+      assert.ok(!/\baz vm run-command\b/.test(step.cmd), `${step.title} uses run-command`);
+      execFileSync('bash', ['-n', '-c', step.cmd]);
+    }
   }
-  const open = parsePowerShellArgs(steps[4].cmd);
-  const script = open[open.indexOf('--scripts') + 1];
-  const echoed = execFileSync('bash', ['-c', script.split('; ')[1].replace('| chpasswd', '')]).toString().trim();
-  assert.strictEqual(echoed, `t128:${values.haPeerPassword}`);
-  assert.ok(script.includes(`Match User t128 Address ${values.node1PrivateIp}/32`));
-  const close = parsePowerShellArgs(steps[7].cmd);
-  assert.ok(close[close.indexOf('--scripts') + 1].includes(`usermod -p '${values.t128PasswordHash}' t128`));
-  const deploy = parsePowerShellArgs(steps[2].cmd);
+  const byTitle = Object.fromEntries(steps.map((st) => [st.title, st]));
+
+  const open = heredocBody(byTitle['Open temporary HA peer access on node0'].cmd);
+  const pwLine = open.split('\n').find((l) => l.endsWith('| chpasswd'));
+  assert.strictEqual(execFileSync('bash', ['-c', pwLine.replace('| chpasswd', '')]).toString(), `t128:${values.haPeerPassword}\n`);
+  assert.ok(open.includes(`'Match User t128 Address ${values.node1PrivateIp}/32'`));
+  assert.ok(open.includes("> /etc/sudoers.d/zz-ha-peer"), 'sudo rule sorts after every other sudoers.d file');
+  assert.ok(/sudo -n true.*exit 1/.test(open), 'open verifies that sudo asks for the password');
+  assert.ok(!/grep -q/.test(open), 'grep -q under pipefail can fail on SIGPIPE');
+  const close = heredocBody(byTitle['Close HA peer access on node0'].cmd);
+  assert.ok(close.includes(`usermod -p '${values.t128PasswordHash}' t128`));
+  assert.ok(close.includes('rm -f /etc/sudoers.d/zz-ha-peer'));
+
+  const deploy = parsePowerShellArgs(byTitle['Deploy node0'].cmd);
   assert.deepStrictEqual(deploy.slice(deploy.indexOf('--parameters'), deploy.indexOf('--parameters') + 3),
     ['--parameters', '@conductor-node0-params.json', 'customData=@conductor-node0-cloud-init.txt']);
+  assert.ok(byTitle['Connect to node0'].cmd.startsWith(`ssh -i <private-key-file> t128@${values.node0PrivateIp}\nsudo -i`));
+  assert.ok(G.mopSteps(Object.assign(filled(), { publicIpMode: 'create' }))[3].cmd.includes('t128@<node0-public-ip>'));
+  assert.ok(byTitle['Deploy node1'].text.includes('after step 8 printed'), byTitle['Deploy node1'].text);
+  assert.ok(byTitle['Open temporary HA peer access on node0'].text.includes('Step 12 reverts it'));
+
+  // PCLI: node0's asset is accepted and node1 is configured before node1 is deployed; node1's asset after node0 restarts.
+  const order = steps.map((st) => st.title);
+  const at = (title) => order.indexOf(title);
+  assert.strictEqual(byTitle["Accept node0's asset"].cmd, 'config authority router Conductor node node0 asset-id Conductor-node0\ncommit force\nshow assets');
+  assert.strictEqual(byTitle['Add node1 to the conductor configuration'].cmd, 'config authority router Conductor node node1 role conductor\ncommit force\nexit');
+  assert.strictEqual(byTitle["Accept node1's asset"].cmd, 'config authority router Conductor node node1 asset-id Conductor-node1\ncommit force\nshow assets');
+  assert.ok(at('Wait until node0 is initialized') < at("Accept node0's asset"));
+  assert.ok(at("Accept node0's asset") < at('Add node1 to the conductor configuration'));
+  assert.ok(at('Add node1 to the conductor configuration') < at('Deploy node1'));
+  assert.ok(at('Restart node0') < at("Accept node1's asset") && at("Accept node1's asset") < at('Verify the HA pair'));
+  const custom = Object.fromEntries(G.mopSteps(Object.assign(filled(), { conductorName: 'AcmeCond' })).map((st) => [st.title, st.cmd]));
+  assert.ok(custom["Accept node1's asset"].startsWith('config authority router AcmeCond node node1 asset-id AcmeCond-node1'));
+  assert.ok(byTitle['Wait until node0 is initialized'].cmd.includes('t128-salt-key --no-color -l unaccepted'), 'status lists pending assets');
+
+  // Optional conductor addresses come after every required step.
+  assert.deepStrictEqual(steps.filter((st) => st.optional).map((st) => st.title), ['Set the conductor addresses for managed routers']);
+  assert.ok(steps.findIndex((st) => st.optional) === steps.filter((st) => !st.optional).length, 'optional steps are last');
+  assert.strictEqual(byTitle['Set the conductor addresses for managed routers'].cmd,
+    `config authority conductor-address ${values.node0PrivateIp}\nconfig authority conductor-address ${values.node1PrivateIp}\ncommit force\nexit`);
+  const pub = G.mopSteps(Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip0', node1PublicIpName: 'pip1', node1ResourceGroup: 'ssr-rg-b' }));
+  const pubOpt = pub.filter((st) => st.optional);
+  assert.deepStrictEqual(pubOpt.map((st) => st.where), ['cloudshell', 'pcli0']);
+  const lookups = pubOpt[0].cmd.split('\n').map(parsePowerShellArgs);
+  assert.deepStrictEqual(lookups.map((a) => [a[a.indexOf('--resource-group') + 1], a[a.indexOf('--name') + 1]]), [['ssr-rg', 'conductor-node0'], ['ssr-rg-b', 'conductor-node1']]);
+  assert.ok(pubOpt[1].cmd.startsWith('config authority conductor-address <node0-address>\nconfig authority conductor-address <node1-address>'));
+  assert.ok(pubOpt[1].text.includes('step 17'), pubOpt[1].text);
+
+  const mop = G.mopDocument(values);
+  for (const heading of ['### Where each command runs', '### Timing and what to expect']) {
+    assert.ok(mop.indexOf(heading) > mop.indexOf('## Procedure') && mop.indexOf(heading) < mop.indexOf('### Step 1:'), heading);
+  }
+  assert.ok(mop.includes('**Run in:** node0 root shell\n'));
+  assert.ok(mop.includes('**Run in:** node0 PCLI (admin)\n'));
+  assert.ok(mop.includes('### Optional: conductor addresses for managed routers\n\nThe HA conductor is complete after step 16.'));
+  assert.ok(mop.includes('### Step 17 (optional): Set the conductor addresses for managed routers'));
+  assert.ok(mop.includes('```pcli\nconfig authority router Conductor node node0 asset-id Conductor-node0'));
+  assert.ok(mop.includes('```bash\nbash -euo pipefail <<\'HA_PEER_OPEN\''));
 });
 
 test('node1 can use its own resource group', () => {
@@ -341,20 +407,15 @@ test('node1 can use its own resource group', () => {
   const same = filled();
   assert.ok(!G.separateResourceGroups(same));
   assert.ok(!G.separateResourceGroups(Object.assign(filled(), { node1ResourceGroup: 'SSR-RG' })), 'resource group names are case-insensitive');
-  for (const step of G.mopSteps(same)) for (const rg of rgArgs(step.cmd)) assert.strictEqual(rg, 'ssr-rg');
+  const azSteps = (values) => G.mopSteps(values).filter((st) => st.where === 'cloudshell');
+  for (const step of azSteps(same)) for (const rg of rgArgs(step.cmd)) assert.strictEqual(rg, 'ssr-rg');
   assert.strictEqual(params(same, 1).virtualNetworkResourceGroup.value, '');
 
   const split = Object.assign(filled(), { publicIpMode: 'create', node1ResourceGroup: 'ssr-rg-b' });
   assert.deepStrictEqual(G.validate(split).fieldErrors, {});
-  const steps = G.mopSteps(split);
-  const byTitle = Object.fromEntries(steps.map((st) => [st.title, rgArgs(st.cmd)]));
+  const byTitle = Object.fromEntries(azSteps(split).map((st) => [st.title, rgArgs(st.cmd)]));
   assert.deepStrictEqual(byTitle['Deploy node0'], ['ssr-rg']);
-  assert.deepStrictEqual(byTitle['Wait until node0 is initialized'], ['ssr-rg']);
-  assert.deepStrictEqual(byTitle['Open temporary HA peer access on node0'], ['ssr-rg']);
   assert.deepStrictEqual(byTitle['Deploy node1'], ['ssr-rg-b']);
-  assert.deepStrictEqual(byTitle['Wait until node1 has joined'], ['ssr-rg-b']);
-  assert.deepStrictEqual(byTitle['Close HA peer access on node0'], ['ssr-rg']);
-  assert.deepStrictEqual(byTitle['Restart node0'], ['ssr-rg']);
   const [rb1, rb0] = rollbackLines(split);
   assert.ok(rb1.includes("'conductor-node1'") && rb1.split('; ').every((c) => rgArgs(c)[0] === 'ssr-rg-b'), rb1);
   assert.ok(rb0.includes("'conductor-node0'") && rb0.split('; ').every((c) => rgArgs(c)[0] === 'ssr-rg'), rb0);

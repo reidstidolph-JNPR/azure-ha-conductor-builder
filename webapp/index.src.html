@@ -101,7 +101,16 @@
   .j-comment { color: #7f8c99; font-style: italic; }
   #steps { padding-left: 22px; }
   #steps li { margin-bottom: 14px; }
-  .step-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .step-head .spacer { flex: 1; }
+  .where { font-size: 11px; border-radius: 10px; padding: 1px 8px; border: 1px solid var(--border); white-space: nowrap; }
+  .where-cloudshell { background: #e8f0fb; color: #1d4f91; border-color: #b9cfee; }
+  .where-terminal { background: #f1ecfa; color: #5b3a96; border-color: #d4c6ee; }
+  .where-node0, .where-node1 { background: var(--accent-2); color: #0b5a2f; border-color: #9fd3b4; }
+  .where-pcli0 { background: #fff3e0; color: #8a4b00; border-color: #f0c98a; }
+  .save-status { color: var(--muted); font-size: 12.5px; }
+  .save-status.warn { color: var(--warn); }
+  .where.optional { background: #eef1f4; color: var(--muted); border-style: dashed; }
   pre.cmd { white-space: pre-wrap; word-break: break-all; margin: 6px 0; }
 
   dialog { border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: min(440px, 92vw); }
@@ -139,6 +148,7 @@
       <button id="btn-reset">Clear</button>
       <button id="btn-export" title="Secrets (artifactory token, HA peer password) are never exported">Export inputs (no secrets)</button>
       <label class="file-btn">Import inputs<input type="file" id="import-file" accept="application/json,.json"></label>
+      <span id="save-status" class="save-status"></span>
       <span class="spacer"></span>
       <button class="primary" data-goto="files">View generated files →</button>
     </div>
@@ -158,7 +168,7 @@
 
     <div class="card" style="margin-top:16px">
       <h3 style="margin-top:0">MOP commands</h3>
-      <p class="note">The procedure from <code>MOP.md</code>: single-line commands for Azure Cloud Shell (PowerShell), run from the directory holding the five deployment files. Wait for the expected result of each step before running the next.</p>
+      <p class="note">The procedure from <code>MOP.md</code>. Azure Cloud Shell (PowerShell) is only used to deploy the VMs, from the directory holding the five deployment files. Every node step runs in an SSH root shell on that node, or in the node0 PCLI (opened from the root shell with <code>su - admin</code>); paste multi-line blocks as a whole. Wait for the expected result of each step before running the next, and expect each node to reboot by itself during initialization.</p>
       <ol id="steps"></ol>
     </div>
   </section>

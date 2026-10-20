@@ -184,6 +184,7 @@
   }
 
   function refresh() {
+    saveInputs();
     const { fieldErrors, warnings, missing } = G.validate(state.values);
     for (const f of G.FIELDS) {
       const msg = fieldErrors[f.id] || '';
@@ -211,11 +212,15 @@
     const list = $('#steps');
     list.innerHTML = '';
     for (const step of G.mopSteps(state.values)) {
-      const pre = h('pre', { class: 'cmd' }, step.cmd);
+      const where = G.WHERE[step.where];
       list.append(h('li', {},
-        h('div', { class: 'step-head' }, h('strong', {}, step.title),
+        h('div', { class: 'step-head' },
+          h('strong', {}, step.title),
+          h('span', { class: `where where-${step.where}`, title: 'Where to run this command' }, where.label),
+          step.optional ? h('span', { class: 'where optional', title: 'Not required to form the HA pair' }, 'optional') : null,
+          h('span', { class: 'spacer' }),
           h('button', { class: 'small', onclick: (e) => copyText(step.cmd, e.target) }, 'Copy')),
-        pre,
+        h('pre', { class: 'cmd' }, step.cmd),
         h('div', { class: 'note' }, `Expected: ${step.expect.replace(/`/g, '')}`)));
     }
   }
@@ -399,6 +404,91 @@
     }
   }
 
+  /* ---------- persistence across page reloads ----------
+   * Inputs are saved on every change. Non-secret inputs go to localStorage and stay until cleared. Secrets (the
+   * fields Export leaves out: artifactory token, HA peer password) go to sessionStorage: they survive a reload of
+   * this tab but are discarded when the tab is closed, so they are never kept on disk indefinitely. */
+  const STORAGE_KEY = 'ssr-ha-conductor-builder/inputs/v1';
+
+  /* The Storage object, or null when the browser blocks it (for example for local files or in private mode). */
+  function openStorage(kind) {
+    try {
+      const store = window[kind];
+      const probe = `${STORAGE_KEY}/probe`;
+      store.setItem(probe, '1');
+      store.removeItem(probe);
+      return store;
+    } catch {
+      return null;
+    }
+  }
+
+  const SAVED = { plain: openStorage('localStorage'), secret: openStorage('sessionStorage') };
+
+  function saveInputs() {
+    const defaults = G.defaults();
+    if (G.FIELDS.every((f) => state.values[f.id] === defaults[f.id])) {
+      clearSavedInputs();
+      return;
+    }
+    const plain = {};
+    const secret = {};
+    for (const f of G.FIELDS) (f.secret ? secret : plain)[f.id] = state.values[f.id];
+    for (const [kind, data] of [['plain', plain], ['secret', secret]]) {
+      try {
+        if (SAVED[kind]) SAVED[kind].setItem(STORAGE_KEY, JSON.stringify(data));
+      } catch {
+        // Quota exceeded or storage revoked: keep working without saving.
+      }
+    }
+  }
+
+  /* Restores saved inputs into state.values; returns how many fields were restored. */
+  function loadSavedInputs() {
+    const read = (store) => {
+      try {
+        const data = JSON.parse((store && store.getItem(STORAGE_KEY)) || 'null');
+        return data && typeof data === 'object' ? data : {};
+      } catch {
+        return {};
+      }
+    };
+    const secret = read(SAVED.secret);
+    const data = G.upgradeValues({ ...read(SAVED.plain), ...secret });
+    let restored = 0;
+    for (const f of G.FIELDS) {
+      if (!(f.id in data)) continue;
+      // Secrets are only ever taken from session storage.
+      if (f.secret && !(f.id in secret)) continue;
+      const v = data[f.id];
+      if (f.kind === 'checkbox' ? typeof v !== 'boolean' : typeof v !== 'string') continue;
+      if (v !== G.defaults()[f.id]) restored++;
+      state.values[f.id] = v;
+    }
+    return restored;
+  }
+
+  function clearSavedInputs() {
+    for (const store of Object.values(SAVED)) {
+      try {
+        if (store) store.removeItem(STORAGE_KEY);
+      } catch {
+        // Nothing saved, or storage unavailable.
+      }
+    }
+  }
+
+  function showSaveStatus(restored) {
+    const el = $('#save-status');
+    if (!SAVED.plain) {
+      el.textContent = 'This browser does not allow saving here: inputs are lost on reload. Use Export inputs to keep them.';
+      el.className = 'save-status warn';
+      return;
+    }
+    el.textContent = `${restored ? `Restored ${restored} saved input${restored > 1 ? 's' : ''}. ` : ''}Inputs are saved in this browser; secrets only until this tab is closed.`;
+    el.className = 'save-status';
+  }
+
   /* ---------- import / export (secrets are never exported) ---------- */
   function exportInputs() {
     const data = {};
@@ -439,9 +529,11 @@
   }
 
   function resetInputs() {
-    if (!confirm('Clear all inputs?')) return;
+    if (!confirm('Clear all inputs? This also removes the inputs saved in this browser.')) return;
+    clearSavedInputs();
     state.values = G.defaults();
     writeValuesToForm();
+    showSaveStatus(0);
   }
 
   /* ---------- wire up ---------- */
@@ -460,6 +552,8 @@
   $('#hash-form').addEventListener('submit', applyHash);
   $('#hash-cancel').addEventListener('click', () => $('#hash-dialog').close());
 
+  const restored = loadSavedInputs();
   renderUsage();
   renderForm();
+  showSaveStatus(restored);
 })();
