@@ -168,7 +168,7 @@
 
     <div class="card" style="margin-top:16px">
       <h3 style="margin-top:0">MOP commands</h3>
-      <p class="note">The procedure from <code>MOP.md</code>. Azure Cloud Shell (PowerShell) is only used to deploy the VMs, from the directory holding the five deployment files. Every node step runs in an SSH root shell on that node, or in the node0 PCLI (opened from the root shell with <code>su - admin</code>); paste multi-line blocks as a whole. Wait for the expected result of each step before running the next, and expect each node to reboot by itself during initialization.</p>
+      <p class="note">The procedure from <code>MOP.md</code>. Azure Cloud Shell (PowerShell) is only used to deploy the VMs, from the directory holding the five deployment files. Every node step runs in an SSH root shell on that node (paste multi-line shell blocks as a whole), or in the node0 PCLI: PCLI steps start with <code>su admin</code> and end with <code>quit</code>, and their commands are entered one at a time. Wait for the expected result of each step before running the next, and expect each node to reboot by itself during initialization.</p>
       <ol id="steps"></ol>
     </div>
   </section>

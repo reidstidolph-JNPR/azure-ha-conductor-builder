@@ -190,9 +190,10 @@ test('node0/node1 onboarding configs carry the HA settings', () => {
   assert.strictEqual(n0.name, 'Conductor-node0');
   assert.strictEqual(n0['cloud-provider'], 'azure');
   assert.ok(!('clustered' in n0) && !('clustered' in n1));
-  assert.deepStrictEqual(n0['initializer-overrides'], { 'router-name': 'Conductor', 'node-ip': '10.0.1.10', timezone: 'America/New_York' });
+  assert.deepStrictEqual(n0['initializer-overrides'], { 'router-name': 'Conductor', 'node-name': 'node0', 'node-ip': '10.0.1.10', timezone: 'America/New_York' });
   assert.deepStrictEqual(n1['initializer-overrides'], {
     'router-name': 'Conductor',
+    'node-name': 'node1',
     'node-ip': '10.0.1.11',
     'ha-peer-ip': '10.0.1.10',
     'ha-peer-name': 'node0',
@@ -270,6 +271,13 @@ test('template wires new and existing public IPs', () => {
   for (const o of [t.outputs.publicIPAddress.value, t.outputs.SSHLogin.value]) assert.ok(o.includes("reference(variables('publicIpRef'), '2019-09-01')"));
 });
 
+test('template enables boot diagnostics for the serial console', () => {
+  const template = JSON.parse(fs.readFileSync(path.join(BUNDLE_DIR, 'conductor_template.json'), 'utf8'));
+  const vm = template.resources.find((r) => r.type === 'Microsoft.Compute/virtualMachines');
+  assert.deepStrictEqual(vm.properties.diagnosticsProfile, { bootDiagnostics: { enabled: true } });
+  assert.ok(vm.apiVersion >= '2020-06-01', 'managed boot diagnostics (no storageUri) needs API 2020-06-01 or later');
+});
+
 test('params files only use parameters defined in the template', () => {
   const template = JSON.parse(fs.readFileSync(path.join(BUNDLE_DIR, 'conductor_template.json'), 'utf8'));
   const defined = new Set(Object.keys(template.parameters));
@@ -331,8 +339,12 @@ test('MOP steps: Cloud Shell only for Azure, node steps are valid bash, secrets 
     if (step.where === 'cloudshell') {
       for (const line of step.cmd.split('\n')) assert.strictEqual(parsePowerShellArgs(line)[0], 'az', `${step.title}: one az command per line`);
     } else if (step.where === 'pcli0') {
-      for (const line of step.cmd.split('\n')) assert.match(line, /^(config authority |commit force$|show (assets|system connectivity)$|exit$)/, `${step.title}: ${line}`);
-      assert.ok(step.text.includes('su - admin') || step.text.startsWith('Still in the node0 PCLI'), `${step.title} says how to get into the PCLI`);
+      // Each PCLI step enters the PCLI with su admin and leaves it with quit (exit only leaves the current menu).
+      const lines = step.cmd.split('\n');
+      assert.strictEqual(lines[0], 'su admin', `${step.title} starts the PCLI`);
+      assert.strictEqual(lines[lines.length - 1], 'quit', `${step.title} quits the PCLI`);
+      for (const line of lines.slice(1, -1)) assert.match(line, /^(config authority |commit force$|show (assets|system connectivity)$)/, `${step.title}: ${line}`);
+      assert.ok(step.text.includes('one at a time, pressing Enter after each one'), `${step.title} says to enter PCLI commands one at a time`);
     } else {
       assert.ok(!/\baz vm run-command\b/.test(step.cmd), `${step.title} uses run-command`);
       execFileSync('bash', ['-n', '-c', step.cmd]);
@@ -354,7 +366,14 @@ test('MOP steps: Cloud Shell only for Azure, node steps are valid bash, secrets 
   const deploy = parsePowerShellArgs(byTitle['Deploy node0'].cmd);
   assert.deepStrictEqual(deploy.slice(deploy.indexOf('--parameters'), deploy.indexOf('--parameters') + 3),
     ['--parameters', '@conductor-node0-params.json', 'customData=@conductor-node0-cloud-init.txt']);
-  assert.ok(byTitle['Connect to node0'].cmd.startsWith(`ssh -i <private-key-file> t128@${values.node0PrivateIp}\nsudo -i`));
+  assert.strictEqual(byTitle['Connect to node0'].cmd, `ssh t128@${values.node0PrivateIp}\nsudo -i`);
+  assert.ok(byTitle['Connect to node0'].text.includes('add `-i <private key file>`'));
+  for (const n of [0, 1]) {
+    const text = byTitle[`Deploy node${n}`].text;
+    assert.ok(text.includes('up to about 2 minutes') && text.includes('reboots twice') && text.includes('5-15 minutes'), text);
+    assert.ok(text.includes(`az serial-console connect --resource-group 'ssr-rg' --name 'conductor-node${n}'`), text);
+  }
+  assert.ok(byTitle['Close HA peer access on node0'].text.includes("`sudo -i` now asks for t128's password, which at this point is the temporary HA peer password"));
   assert.ok(G.mopSteps(Object.assign(filled(), { publicIpMode: 'create' }))[3].cmd.includes('t128@<node0-public-ip>'));
   assert.ok(byTitle['Deploy node1'].text.includes('after step 8 printed'), byTitle['Deploy node1'].text);
   assert.ok(byTitle['Open temporary HA peer access on node0'].text.includes('Step 12 reverts it'));
@@ -362,28 +381,29 @@ test('MOP steps: Cloud Shell only for Azure, node steps are valid bash, secrets 
   // PCLI: node0's asset is accepted and node1 is configured before node1 is deployed; node1's asset after node0 restarts.
   const order = steps.map((st) => st.title);
   const at = (title) => order.indexOf(title);
-  assert.strictEqual(byTitle["Accept node0's asset"].cmd, 'config authority router Conductor node node0 asset-id Conductor-node0\ncommit force\nshow assets');
-  assert.strictEqual(byTitle['Add node1 to the conductor configuration'].cmd, 'config authority router Conductor node node1 role conductor\ncommit force\nexit');
-  assert.strictEqual(byTitle["Accept node1's asset"].cmd, 'config authority router Conductor node node1 asset-id Conductor-node1\ncommit force\nshow assets');
+  assert.strictEqual(byTitle["Accept node0's asset"].cmd, 'su admin\nconfig authority router Conductor node node0 asset-id Conductor-node0\ncommit force\nshow assets\nquit');
+  assert.strictEqual(byTitle['Add node1 to the conductor configuration'].cmd, 'su admin\nconfig authority router Conductor node node1 role conductor\ncommit force\nquit');
+  assert.strictEqual(byTitle["Accept node1's asset"].cmd, 'su admin\nconfig authority router Conductor node node1 asset-id Conductor-node1\ncommit force\nshow assets\nquit');
+  assert.strictEqual(byTitle['Verify the HA pair'].cmd, 'su admin\nshow system connectivity\nshow assets\nquit');
   assert.ok(at('Wait until node0 is initialized') < at("Accept node0's asset"));
   assert.ok(at("Accept node0's asset") < at('Add node1 to the conductor configuration'));
   assert.ok(at('Add node1 to the conductor configuration') < at('Deploy node1'));
   assert.ok(at('Restart node0') < at("Accept node1's asset") && at("Accept node1's asset") < at('Verify the HA pair'));
   const custom = Object.fromEntries(G.mopSteps(Object.assign(filled(), { conductorName: 'AcmeCond' })).map((st) => [st.title, st.cmd]));
-  assert.ok(custom["Accept node1's asset"].startsWith('config authority router AcmeCond node node1 asset-id AcmeCond-node1'));
+  assert.ok(custom["Accept node1's asset"].startsWith('su admin\nconfig authority router AcmeCond node node1 asset-id AcmeCond-node1'));
   assert.ok(byTitle['Wait until node0 is initialized'].cmd.includes('t128-salt-key --no-color -l unaccepted'), 'status lists pending assets');
 
   // Optional conductor addresses come after every required step.
   assert.deepStrictEqual(steps.filter((st) => st.optional).map((st) => st.title), ['Set the conductor addresses for managed routers']);
   assert.ok(steps.findIndex((st) => st.optional) === steps.filter((st) => !st.optional).length, 'optional steps are last');
   assert.strictEqual(byTitle['Set the conductor addresses for managed routers'].cmd,
-    `config authority conductor-address ${values.node0PrivateIp}\nconfig authority conductor-address ${values.node1PrivateIp}\ncommit force\nexit`);
+    `su admin\nconfig authority conductor-address ${values.node0PrivateIp}\nconfig authority conductor-address ${values.node1PrivateIp}\ncommit force\nquit`);
   const pub = G.mopSteps(Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip0', node1PublicIpName: 'pip1', node1ResourceGroup: 'ssr-rg-b' }));
   const pubOpt = pub.filter((st) => st.optional);
   assert.deepStrictEqual(pubOpt.map((st) => st.where), ['cloudshell', 'pcli0']);
   const lookups = pubOpt[0].cmd.split('\n').map(parsePowerShellArgs);
   assert.deepStrictEqual(lookups.map((a) => [a[a.indexOf('--resource-group') + 1], a[a.indexOf('--name') + 1]]), [['ssr-rg', 'conductor-node0'], ['ssr-rg-b', 'conductor-node1']]);
-  assert.ok(pubOpt[1].cmd.startsWith('config authority conductor-address <node0-address>\nconfig authority conductor-address <node1-address>'));
+  assert.ok(pubOpt[1].cmd.startsWith('su admin\nconfig authority conductor-address <node0-address>\nconfig authority conductor-address <node1-address>'));
   assert.ok(pubOpt[1].text.includes('step 17'), pubOpt[1].text);
 
   const mop = G.mopDocument(values);
@@ -394,7 +414,7 @@ test('MOP steps: Cloud Shell only for Azure, node steps are valid bash, secrets 
   assert.ok(mop.includes('**Run in:** node0 PCLI (admin)\n'));
   assert.ok(mop.includes('### Optional: conductor addresses for managed routers\n\nThe HA conductor is complete after step 16.'));
   assert.ok(mop.includes('### Step 17 (optional): Set the conductor addresses for managed routers'));
-  assert.ok(mop.includes('```pcli\nconfig authority router Conductor node node0 asset-id Conductor-node0'));
+  assert.ok(mop.includes('```pcli\nsu admin\nconfig authority router Conductor node node0 asset-id Conductor-node0'));
   assert.ok(mop.includes('```bash\nbash -euo pipefail <<\'HA_PEER_OPEN\''));
 });
 
@@ -497,6 +517,59 @@ test('node1 in its own resource group can use its own region, VNet, subnet and i
   const single = G.mopDocument(filled());
   assert.ok(single.includes('| Region | `eastus` |') && single.includes('| Managed identity | `ssr-id` |'));
   assert.ok(!single.includes('peered'));
+});
+
+test('custom SSR node names reach the initializer, the PCLI steps and the topology', () => {
+  const values = Object.assign(filled(), { conductorName: 'AcmeCond', node0Name: 'east-1', node1Name: 'west-1' });
+  assert.deepStrictEqual(G.validate(values).fieldErrors, {});
+  const [n0, n1] = [0, 1].map((n) => G.onboardingConfig(values, n));
+
+  // The bootstrapper's schema only accepts node0/node1 as node-name; the SSR name goes to the initializer.
+  assert.strictEqual(n0['node-name'], 'node0');
+  assert.strictEqual(n1['node-name'], 'node1');
+  assert.strictEqual(n0['initializer-overrides']['node-name'], 'east-1');
+  assert.strictEqual(n1['initializer-overrides']['node-name'], 'west-1');
+  assert.strictEqual(n1['initializer-overrides']['ha-peer-name'], 'east-1');
+  assert.strictEqual(n0.name, 'AcmeCond-east-1');
+  assert.strictEqual(n1['pdc-key-comment'], 'AcmeCond-west-1');
+
+  const repo = path.resolve(__dirname, '../..');
+  const schemaDir = path.join(repo, 'packaging/apps/hardware/bootstrapper/data/schemas');
+  const prefsSchema = path.join(repo, 'python/initializer/initializer/data/preferences.schema.json');
+  if (fs.existsSync(schemaDir) && fs.existsSync(prefsSchema)) {
+    const conductor = JSON.parse(fs.readFileSync(path.join(schemaDir, 'conductor-onboarding-config-schema.json'), 'utf8'));
+    const common = JSON.parse(fs.readFileSync(path.join(schemaDir, 'common-onboarding-config-schema.json'), 'utf8'));
+    const prefs = JSON.parse(fs.readFileSync(prefsSchema, 'utf8'));
+    for (const cfg of [n0, n1]) {
+      assert.ok(conductor.properties['node-name'].enum.includes(cfg['node-name']));
+      assert.match(cfg.name, new RegExp(common.definitions['name-id'].pattern));
+    }
+    const nameId = new RegExp(prefs.definitions['name-id'].pattern);
+    for (const name of ['east-1', 'west-1']) assert.match(name, nameId, 'initializer node-name / ha-peer-name pattern');
+  }
+
+  const steps = Object.fromEntries(G.mopSteps(values).map((st) => [st.title, st]));
+  assert.ok(steps["Accept node0's asset"].cmd.startsWith('su admin\nconfig authority router AcmeCond node east-1 asset-id AcmeCond-east-1\n'));
+  assert.ok(steps['Add node1 to the conductor configuration'].cmd.startsWith('su admin\nconfig authority router AcmeCond node west-1 role conductor\n'));
+  assert.ok(steps["Accept node1's asset"].cmd.startsWith('su admin\nconfig authority router AcmeCond node west-1 asset-id AcmeCond-west-1\n'));
+  assert.ok(steps["Accept node0's asset"].text.includes('admin@east-1.AcmeCond#'));
+  assert.ok(steps['Wait until node1 has joined'].expect.includes('east-1=10.0.1.10, west-1=10.0.1.11'));
+  const mop = G.mopDocument(values);
+  assert.ok(!/\bnode[01]=|node node[01]\b|admin@node0|AcmeCond-node[01]/.test(mop), 'no SSR reference still uses node0/node1');
+  assert.ok(mop.includes('| node0 | SSR node `east-1` (hostname and asset ID `AcmeCond-east-1`)'));
+  assert.ok(G.topologyDiagram(values).includes('SSR router AcmeCond, node east-1'));
+  assert.ok(G.buildGeneratedFiles(values).find((f) => f.path === G.FILES.c1).content.includes('# SSR node name: west-1 (initializer-overrides.node-name'));
+
+  // Cleared inputs fall back to node0/node1.
+  const cleared = G.onboardingConfig(Object.assign(filled(), { node0Name: '', node1Name: '' }), 1);
+  assert.strictEqual(cleared['initializer-overrides']['node-name'], 'node1');
+  assert.strictEqual(cleared['initializer-overrides']['ha-peer-name'], 'node0');
+
+  const bad = (over) => G.validate(Object.assign(filled(), over)).fieldErrors;
+  assert.ok(bad({ node0Name: 'east_1' }).node0Name, 'underscores are not valid in hostnames');
+  assert.ok(bad({ node0Name: '-east' }).node0Name);
+  assert.ok(bad({ node0Name: 'East', node1Name: 'east' }).node1Name, 'names must differ (case-insensitive)');
+  assert.ok(bad({ conductorName: 'C'.repeat(57), node0Name: 'n'.repeat(10) }).node0Name, 'hostname longer than 63 characters');
 });
 
 test('cross-field validation', () => {

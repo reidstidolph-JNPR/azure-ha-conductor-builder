@@ -19,7 +19,7 @@ Resource group <input-your-resource-group> (<input-your-azure-region>) - created
 
 ┌─ Azure VM conductor-node0 ───────────┐              ┌─ Azure VM conductor-node1 ───────────┐
 │ zone 1                               │              │ zone 2                               │
-│ SSR router Conductor, node0          │              │ SSR router Conductor, node1          │
+│ SSR router Conductor, node node0     │              │ SSR router Conductor, node node1     │
 │ hostname Conductor-node0             │              │ hostname Conductor-node1             │
 │                                      │    HA sync   │                                      │
 │ ge-0-0  <input-node0-private-ip>     │<────────────>│ ge-0-0  <input-node1-private-ip>     │
@@ -44,7 +44,7 @@ Resource group <input-your-resource-group> (<input-your-azure-region>) - created
 
 | SSR term (inside the VM) | Azure resource (outside the VM) | Details |
 |---|---|---|
-| Conductor router `Conductor`, nodes `node0` / `node1` | VMs `conductor-node0` / `conductor-node1` (zone 1 / zone 2) | One VM per node from the BYOL marketplace image, deployed from the same ARM template. Hostnames `Conductor-node0` / `Conductor-node1`. |
+| Conductor router `Conductor`, nodes `node0` / `node1` | VMs `conductor-node0` / `conductor-node1` (zone 1 / zone 2) | One VM per node from the BYOL marketplace image, deployed from the same ARM template. Hostnames (also the asset IDs) `Conductor-node0` / `Conductor-node1`. The MOP calls the nodes node0 and node1 whatever their SSR node names are. |
 | Interface `ge-0-0` | NICs `conductor-node0-control` / `conductor-node1-control` | The only NIC on each VM, so SSR names it `ge-0-0` (NICs become `ge-0-0`, `ge-0-1`, ... in attach order). Tagged `SSR-ROLE=MGMT`; accelerated networking and IP forwarding enabled. |
 | Node IP (`node-ip`), the conductor address | Static private IPs `<input-node0-private-ip>` / `<input-node1-private-ip>` | The NIC IP (template `controlPrivateIp`) and the cloud-init `node-ip` are the same value. Managed routers connect to both addresses. |
 | HA sync interface (node1 `ha-peer-ip` = `<input-node0-private-ip>`) | Same NIC and IP; no HA sync NIC | Conductor-to-conductor sync runs over `ge-0-0` through the subnet. Hardware conductors use a dedicated HA sync NIC on `169.254.253.x` (`clustered`), which an Azure VNet cannot carry. |
@@ -82,16 +82,16 @@ In PowerShell, quote every argument that starts with `@`, otherwise PowerShell t
 In Azure each conductor node has a **single control interface**, which also carries HA sync. The MOP follows the documented cloud HA procedure:
 
 1. **node0** is deployed. On first boot the hardware bootstrapper reads the onboarding config written by cloud-init, installs the requested SSR version, and runs the initializer as a conductor. The `initializer-overrides` set the router name and `node-ip`.
-   - **In the node0 PCLI, node0's asset is accepted and node1 is added to the configuration.** After its post-initialization reboot, node0's salt minion (minion ID = hostname = `<router name>-node0`) registers with node0's own salt master and waits as a pending asset. Configuring `authority router <router name> node node0 asset-id <router name>-node0` accepts it: the Automated Provisioner accepts a pending key as soon as its asset ID appears in the configuration. In the same PCLI session, `node node1 role conductor` is added, so node1 finds its own node in the configuration it receives when it joins.
+   - **In the node0 PCLI, node0's asset is accepted and node1 is added to the configuration.** After its post-initialization reboot, node0's salt minion (minion ID = hostname = `<router name>-<node0 name>`) registers with node0's own salt master and waits as a pending asset. Configuring `authority router <router name> node <node0 name> asset-id <router name>-<node0 name>` accepts it: the Automated Provisioner accepts a pending key as soon as its asset ID appears in the configuration. In the same PCLI session, `node <node1 name> role conductor` is added, so node1 finds its own node in the configuration it receives when it joins.
 2. **node0 is opened to node1 temporarily.** node1's initializer must log in to node0 as `t128` with a password, and its `sudo` must prompt for that password: the initializer opens its SFTP session with `sudo --stdin`, which fails with `EOF during negotiation` when sudo does not ask. Azure images disable password SSH and grant `t128` passwordless sudo (cloud-init's `90-cloud-init-users`, and possibly other files such as the Azure agent's). One block pasted into node0's root shell sets the temporary password, adds `/etc/sudoers.d/zz-ha-peer` (`t128 ALL=(ALL) ALL`, which sorts after every other sudoers file, and sudo applies the last matching rule), allows password SSH for `t128` **only from node1's IP**, and then tests that sudo really asks and sshd really accepts. This automates "Configure Node A" in the HA doc.
 3. **node1** is deployed with `learn-from-ha-peer`. Its initializer logs in to node0, exchanges SSH keys, adds node1 to node0's `global.init`, and copies the environment and salt master keys.
 4. **node0 is closed again.** A second block removes the SSH exception and `zz-ha-peer`, resets `t128` to the password hash from the onboarding config, and warns if any other setting still accepts passwords. node0 is then restarted so it recognizes node1.
-5. **In the node0 PCLI, node1's asset is accepted.** node1's minion (`<router name>-node1`) is pending once node1 has joined; configuring `node node1 asset-id <router name>-node1` accepts it. `show system connectivity` and `show assets` (both assets `Running`) confirm the pair.
+5. **In the node0 PCLI, node1's asset is accepted.** node1's minion (`<router name>-<node1 name>`) is pending once node1 has joined; configuring `node <node1 name> asset-id <router name>-<node1 name>` accepts it. `show system connectivity` and `show assets` (both assets `Running`) confirm the pair.
 6. **Optional, in the node0 PCLI: conductor addresses for managed routers.** `authority conductor-address` lists the addresses (up to two) that managed routers use to reach the conductor nodes; routers receive it in their configuration and connect to both nodes. The MOP keeps this as optional steps at the end because the right addresses are often only known after deployment: with public IPs, a Cloud Shell step first prints each node's private and public IP (`az vm list-ip-addresses`), and the PCLI step uses `<node0-address>` / `<node1-address>` placeholders; without public IPs, the PCLI step is prefilled with the private IPs.
 
 Azure Cloud Shell is only used to deploy (and roll back) the VMs. Everything on a node runs in an SSH root shell on that node, opened as soon as the VM answers SSH. Earlier versions of the MOP sent node commands with `az vm run-command`, which proved fragile: Azure runs one run-command per VM at a time, and commands sent while a node was rebooting during initialization stayed pending and blocked the ones after them. Hand-editing those one-liners into shell commands then introduced mistakes.
 
-Progress is watched with a status command in the node's root shell. It prints the phase once a minute (`INSTALLING`, `STARTING`, `INITIALIZING`, `READY` or `FAILED`) together with the uptime, which makes the expected reboots visible. It stops at `READY` or `FAILED` and then lists the conductors in `global.init` and the pending (not yet accepted) assets from `t128-salt-key`, so the asset IDs to accept in the PCLI can be confirmed rather than assumed. The MOP explains up front that each node takes 20-45 minutes, reboots on its own at least twice and closes the SSH session each time, and that the only right reaction is to reconnect and paste the status command again. node1 must not be deployed before node0 is `READY` and the open step printed `HA_PEER_ACCESS_OPEN`: the initializer checks the peer login once and the bootstrapper does not retry. If node1 still fails at that point, it can be retried without redeploying (`systemctl start --no-block 128T-hardware-bootstrapper`).
+Progress is watched with a status command in the node's root shell. It prints the phase once a minute (`INSTALLING`, `STARTING`, `INITIALIZING`, `READY` or `FAILED`) together with the uptime, which makes the expected reboots visible. It stops at `READY` or `FAILED` and then lists the conductors in `global.init` and the pending (not yet accepted) assets from `t128-salt-key`, so the asset IDs to accept in the PCLI can be confirmed rather than assumed. The MOP explains up front that each deployment takes up to about 2 minutes, after which the node installs and initializes SSR and reboots twice (typically 5-15 minutes, longer on a slow download), closing the SSH session each time, and that the only right reaction is to reconnect and paste the status command again. The reboot cycle can be watched on the VM's serial console; the template enables the managed boot diagnostics that the serial console requires. PCLI steps start with `su admin` and end with `quit`, and their commands are entered one at a time. node1 must not be deployed before node0 is `READY` and the open step printed `HA_PEER_ACCESS_OPEN`: the initializer checks the peer login once and the bootstrapper does not retry. If node1 still fails at that point, it can be retried without redeploying (`systemctl start --no-block 128T-hardware-bootstrapper`).
 
 ### What changed from the original sample files
 
@@ -101,16 +101,19 @@ Progress is watched with a status command in the node's root shell. It prints th
 - `node-ip` must be known before deployment, so the NIC now uses a **static private IP** (`controlPrivateIp`). Each NSG allows all traffic from the HA peer (`haPeerPrivateIp`).
 - Both nodes were pinned to zone `2`. The zone is now a parameter (node0 zone 1, node1 zone 2 by default; leave it empty and use `availabilitySetName` where zones are unavailable).
 - node1 can be deployed to its own resource group (`node1 resource group` input); its MOP commands then use that resource group. node1 can then also have its own region, VNet, VNet resource group, control subnet, managed identity and identity resource group; each one left empty uses node0's value, and the web app shows that default as the field's placeholder. An empty node1 VNet or identity resource group means node1's resource group when node1 names its own VNet or identity, and otherwise the resource group of node0's (shared) one, which node1's params file then names explicitly instead of leaving the template default (the deployment resource group). A different region needs a different VNet, and separate VNets must be peered so the nodes reach each other on their private IPs (the MOP lists this as a prerequisite). An availability set cannot be used with separate resource groups, because both VMs must be in the availability set's resource group.
-- Each node's `name` (hostname / salt minion ID) is `<router name>-node0` / `-node1`, so the nodes do not collide. The real router name is set through `initializer-overrides.router-name`, mirroring the bootstrapper's own hardware HA behavior.
+- Each node's `name` (hostname / salt minion ID) is `<router name>-<node name>`, so the nodes do not collide. The real router name is set through `initializer-overrides.router-name`, mirroring the bootstrapper's own hardware HA behavior.
 - Smaller fixes: the template's `commandToExecute` was the literal string `['usermod -a -G wheel t128']`, and the extension location now follows the `location` parameter. Optional parameters were added for the VNet / identity resource groups and a public IP: `createPublicIp` creates one, or `existingPublicIpName` (with `existingPublicIpResourceGroup`) attaches a public IP that already exists. An existing public IP must be Standard SKU, static, in the same region, unattached, and zone-redundant or in the node's zone; it is only detached, never deleted, by the MOP rollback.
 
 ### Onboarding config differences between the nodes
+
+"node0" and "node1" are the MOP's names for the first and second conductor node. Their SSR node names are inputs (default `node0` / `node1`). The bootstrapper's onboarding schema only accepts `node0` or `node1` as the top-level `node-name`, so that key always keeps the default, and the SSR node name is passed to the initializer as `initializer-overrides.node-name`. The bootstrapper applies `initializer-overrides` last, so the override wins; the initializer writes the name to `global.init`, from which SSR names the node in its configuration. Each node's hostname, and so its asset ID, is `<router name>-<node name>`.
 
 node0:
 
 ```json
 "initializer-overrides": {
   "router-name": "Conductor",
+  "node-name": "<node0 name>",
   "node-ip": "<node0 private IP>"
 }
 ```
@@ -120,9 +123,10 @@ node1:
 ```json
 "initializer-overrides": {
   "router-name": "Conductor",
+  "node-name": "<node1 name>",
   "node-ip": "<node1 private IP>",
   "ha-peer-ip": "<node0 private IP>",
-  "ha-peer-name": "node0",
+  "ha-peer-name": "<node0 name>",
   "learn-from-ha-peer": true,
   "ha-peer-username": "t128",
   "unsafe-ha-peer-password": "<temporary password>"
@@ -157,61 +161,63 @@ Every input, what it is, and where it goes. The web app shows the same informati
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 15 | node0 VM name | No | `conductor-node0` | Azure VM name of the primary node (also prefixes its NIC/NSG/disk names). | `conductor-node0-params.json: instanceName`<br>`MOP.md: rollback commands` |
-| 16 | node0 private IP | Yes | - | Free static IP in the control subnet for node0. It is node0's conductor address and its HA address. Placeholder: `<input-node0-private-ip>` | `conductor-node0-params.json: controlPrivateIp`<br>`conductor-node1-params.json: haPeerPrivateIp`<br>`conductor-node0-cloud-init.txt: initializer-overrides.node-ip`<br>`conductor-node1-cloud-init.txt: initializer-overrides.ha-peer-ip`<br>`MOP.md: SSH target, optional conductor-address` |
-| 17 | node0 availability zone | No | `1` | Zone of node0. Empty when the region has no zones (use an availability set instead). | `conductor-node0-params.json: availabilityZone` |
-| 18 | node0 existing public IP name | Yes (only when Public IP per node = `existing`) | - | Existing public IP for node0: Standard SKU, static, same region, not attached to anything else, and zone-redundant or in node0's zone. Placeholder: `<input-node0-existing-public-ip-name>` | `conductor-node0-params.json: existingPublicIpName` |
-| 19 | node1 VM name | No | `conductor-node1` | Azure VM name of the secondary node. | `conductor-node1-params.json: instanceName`<br>`MOP.md: rollback commands` |
-| 20 | node1 private IP | Yes | - | Free static IP in the control subnet for node1. Placeholder: `<input-node1-private-ip>` | `conductor-node1-params.json: controlPrivateIp`<br>`conductor-node0-params.json: haPeerPrivateIp`<br>`conductor-node1-cloud-init.txt: initializer-overrides.node-ip`<br>`MOP.md: SSH target, open and close HA peer access (sshd Match Address), optional conductor-address` |
-| 21 | node1 availability zone | No | `2` | Zone of node1. Use a different zone than node0. | `conductor-node1-params.json: availabilityZone` |
-| 22 | node1 existing public IP name | Yes (only when Public IP per node = `existing`) | - | Existing public IP for node1, with the same requirements as node0's. Must differ from node0's. Placeholder: `<input-node1-existing-public-ip-name>` | `conductor-node1-params.json: existingPublicIpName` |
+| 15 | node0 SSR node name | No | `node0` | Name of the first conductor node inside SSR: the PCLI prompt, the configuration, show system connectivity and global.init. Letters, digits and hyphens. The node's hostname and asset ID become &lt;conductor name&gt;-&lt;node name&gt;. The MOP keeps calling this node "node0". | `conductor-node0-cloud-init.txt: initializer-overrides.node-name, name, pdc-key-comment`<br>`conductor-node1-cloud-init.txt: initializer-overrides.ha-peer-name`<br>`MOP.md: PCLI node name and asset ID` |
+| 16 | node1 SSR node name | No | `node1` | Name of the second conductor node inside SSR, with the same rules as node0's. Must differ from node0's. The MOP keeps calling this node "node1". | `conductor-node1-cloud-init.txt: initializer-overrides.node-name, name, pdc-key-comment`<br>`MOP.md: PCLI node name and asset ID` |
+| 17 | node0 VM name | No | `conductor-node0` | Azure VM name of the primary node (also prefixes its NIC/NSG/disk names). | `conductor-node0-params.json: instanceName`<br>`MOP.md: rollback commands` |
+| 18 | node0 private IP | Yes | - | Free static IP in the control subnet for node0. It is node0's conductor address and its HA address. Placeholder: `<input-node0-private-ip>` | `conductor-node0-params.json: controlPrivateIp`<br>`conductor-node1-params.json: haPeerPrivateIp`<br>`conductor-node0-cloud-init.txt: initializer-overrides.node-ip`<br>`conductor-node1-cloud-init.txt: initializer-overrides.ha-peer-ip`<br>`MOP.md: SSH target, optional conductor-address` |
+| 19 | node0 availability zone | No | `1` | Zone of node0. Empty when the region has no zones (use an availability set instead). | `conductor-node0-params.json: availabilityZone` |
+| 20 | node0 existing public IP name | Yes (only when Public IP per node = `existing`) | - | Existing public IP for node0: Standard SKU, static, same region, not attached to anything else, and zone-redundant or in node0's zone. Placeholder: `<input-node0-existing-public-ip-name>` | `conductor-node0-params.json: existingPublicIpName` |
+| 21 | node1 VM name | No | `conductor-node1` | Azure VM name of the secondary node. | `conductor-node1-params.json: instanceName`<br>`MOP.md: rollback commands` |
+| 22 | node1 private IP | Yes | - | Free static IP in the control subnet for node1. Placeholder: `<input-node1-private-ip>` | `conductor-node1-params.json: controlPrivateIp`<br>`conductor-node0-params.json: haPeerPrivateIp`<br>`conductor-node1-cloud-init.txt: initializer-overrides.node-ip`<br>`MOP.md: SSH target, open and close HA peer access (sshd Match Address), optional conductor-address` |
+| 23 | node1 availability zone | No | `2` | Zone of node1. Use a different zone than node0. | `conductor-node1-params.json: availabilityZone` |
+| 24 | node1 existing public IP name | Yes (only when Public IP per node = `existing`) | - | Existing public IP for node1, with the same requirements as node0's. Must differ from node0's. Placeholder: `<input-node1-existing-public-ip-name>` | `conductor-node1-params.json: existingPublicIpName` |
 
 #### node1 in its own resource group (optional)
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 23 | node1 resource group | No | (empty) | Existing resource group for node1's VM, NIC, NSG (and public IP) when it differs from node0's. Empty = same resource group as node0. When set, node1 can also use its own region, VNet, subnet and managed identity below. | `MOP.md: --resource-group of node1 az commands` |
-| 24 | node1 Azure region | No (only when node1 resource group is set) | (empty) | Region of node1's VNet when it differs from node0's. Empty = node0's region. A different region needs its own VNet. | `conductor-node1-params.json: location` |
-| 25 | node1 VNet name | No (only when node1 resource group is set) | (empty) | Existing VNet for node1 when it differs from node0's. Empty = node0's VNet. Separate VNets must be peered (or otherwise connected) so the nodes reach each other on their private IPs. | `conductor-node1-params.json: virtualNetworkName` |
-| 26 | node1 VNet resource group | No (only when node1 resource group is set) | (empty) | Resource group of node1's VNet. Empty = node1's resource group when node1 VNet name is set, otherwise the resource group of node0's VNet. | `conductor-node1-params.json: virtualNetworkResourceGroup` |
-| 27 | node1 control subnet name | No (only when node1 resource group is set) | (empty) | Existing subnet in node1's VNet for node1's control interface. Empty = same subnet name as node0. | `conductor-node1-params.json: controlSubnetName` |
-| 28 | node1 user assigned managed identity | No (only when node1 resource group is set) | (empty) | Identity attached to node1 when it differs from node0's, with the same read permissions. Empty = node0's identity. | `conductor-node1-params.json: managedIdentity` |
-| 29 | node1 managed identity resource group | No (only when node1 resource group is set) | (empty) | Resource group of node1's identity. Empty = node1's resource group when node1 managed identity is set, otherwise the resource group of node0's identity. | `conductor-node1-params.json: managedIdentityResourceGroup` |
+| 25 | node1 resource group | No | (empty) | Existing resource group for node1's VM, NIC, NSG (and public IP) when it differs from node0's. Empty = same resource group as node0. When set, node1 can also use its own region, VNet, subnet and managed identity below. | `MOP.md: --resource-group of node1 az commands` |
+| 26 | node1 Azure region | No (only when node1 resource group is set) | (empty) | Region of node1's VNet when it differs from node0's. Empty = node0's region. A different region needs its own VNet. | `conductor-node1-params.json: location` |
+| 27 | node1 VNet name | No (only when node1 resource group is set) | (empty) | Existing VNet for node1 when it differs from node0's. Empty = node0's VNet. Separate VNets must be peered (or otherwise connected) so the nodes reach each other on their private IPs. | `conductor-node1-params.json: virtualNetworkName` |
+| 28 | node1 VNet resource group | No (only when node1 resource group is set) | (empty) | Resource group of node1's VNet. Empty = node1's resource group when node1 VNet name is set, otherwise the resource group of node0's VNet. | `conductor-node1-params.json: virtualNetworkResourceGroup` |
+| 29 | node1 control subnet name | No (only when node1 resource group is set) | (empty) | Existing subnet in node1's VNet for node1's control interface. Empty = same subnet name as node0. | `conductor-node1-params.json: controlSubnetName` |
+| 30 | node1 user assigned managed identity | No (only when node1 resource group is set) | (empty) | Identity attached to node1 when it differs from node0's, with the same read permissions. Empty = node0's identity. | `conductor-node1-params.json: managedIdentity` |
+| 31 | node1 managed identity resource group | No (only when node1 resource group is set) | (empty) | Resource group of node1's identity. Empty = node1's resource group when node1 managed identity is set, otherwise the resource group of node0's identity. | `conductor-node1-params.json: managedIdentityResourceGroup` |
 
 #### SSR software and conductor identity
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 30 | Conductor (router) name | No | `Conductor` | Name of the conductor router. Each node also gets the hostname &lt;name&gt;-node0 / &lt;name&gt;-node1, which is also its asset ID (salt minion ID) in the PCLI. | `conductor-node0-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment`<br>`conductor-node1-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment`<br>`MOP.md: PCLI router name and asset IDs` |
-| 31 | SSR version | No | `7.2.3` | SSR software version installed on both nodes (6.3.0 or later). | `conductor-node0-cloud-init.txt: ssr-version`<br>`conductor-node1-cloud-init.txt: ssr-version` |
-| 32 | Artifactory username | Yes | - | Juniper software repository user used to download SSR. Placeholder: `<input-your-artifactory-username>` | `conductor-node0-cloud-init.txt: artifactory-user`<br>`conductor-node1-cloud-init.txt: artifactory-user` |
-| 33 | Artifactory token | Yes | - | Token/password for the artifactory user. Placeholder: `<input-your-artifactory-token>` | `conductor-node0-cloud-init.txt: artifactory-password`<br>`conductor-node1-cloud-init.txt: artifactory-password` |
+| 32 | Conductor (router) name | No | `Conductor` | Name of the conductor router. Each node also gets the hostname &lt;name&gt;-&lt;node name&gt; (by default &lt;name&gt;-node0 / &lt;name&gt;-node1), which is also its asset ID (salt minion ID) in the PCLI. | `conductor-node0-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment`<br>`conductor-node1-cloud-init.txt: initializer-overrides.router-name, name, pdc-key-comment`<br>`MOP.md: PCLI router name and asset IDs` |
+| 33 | SSR version | No | `7.2.3` | SSR software version installed on both nodes (6.3.0 or later). | `conductor-node0-cloud-init.txt: ssr-version`<br>`conductor-node1-cloud-init.txt: ssr-version` |
+| 34 | Artifactory username | Yes | - | Juniper software repository user used to download SSR. Placeholder: `<input-your-artifactory-username>` | `conductor-node0-cloud-init.txt: artifactory-user`<br>`conductor-node1-cloud-init.txt: artifactory-user` |
+| 35 | Artifactory token | Yes | - | Token/password for the artifactory user. Placeholder: `<input-your-artifactory-token>` | `conductor-node0-cloud-init.txt: artifactory-password`<br>`conductor-node1-cloud-init.txt: artifactory-password` |
 
 #### Account passwords (SHA-512 crypt hashes)
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 34 | admin password hash | Yes | - | SHA-512 crypt hash ($6$...) for the SSR admin account (PCLI/GUI). Never a clear-text password. Placeholder: `<input-sha512-crypt-hash-of-admin-password>` | `conductor-node0-cloud-init.txt: admin-password`<br>`conductor-node1-cloud-init.txt: admin-password` |
-| 35 | root password hash | Yes | - | SHA-512 crypt hash for the Linux root account. Placeholder: `<input-sha512-crypt-hash-of-root-password>` | `conductor-node0-cloud-init.txt: root-password`<br>`conductor-node1-cloud-init.txt: root-password` |
-| 36 | t128 password hash | Yes | - | SHA-512 crypt hash for the Linux t128 account (SSH still uses the key). Also restores t128 on node0 after node1 joins. Placeholder: `<input-sha512-crypt-hash-of-t128-password>` | `conductor-node0-cloud-init.txt: t128-password`<br>`conductor-node1-cloud-init.txt: t128-password`<br>`MOP.md: close HA peer access (restores t128's password)` |
+| 36 | admin password hash | Yes | - | SHA-512 crypt hash ($6$...) for the SSR admin account (PCLI/GUI). Never a clear-text password. Placeholder: `<input-sha512-crypt-hash-of-admin-password>` | `conductor-node0-cloud-init.txt: admin-password`<br>`conductor-node1-cloud-init.txt: admin-password` |
+| 37 | root password hash | Yes | - | SHA-512 crypt hash for the Linux root account. Placeholder: `<input-sha512-crypt-hash-of-root-password>` | `conductor-node0-cloud-init.txt: root-password`<br>`conductor-node1-cloud-init.txt: root-password` |
+| 38 | t128 password hash | Yes | - | SHA-512 crypt hash for the Linux t128 account (SSH still uses the key). Also restores t128 on node0 after node1 joins. Placeholder: `<input-sha512-crypt-hash-of-t128-password>` | `conductor-node0-cloud-init.txt: t128-password`<br>`conductor-node1-cloud-init.txt: t128-password`<br>`MOP.md: close HA peer access (restores t128's password)` |
 
 #### HA peer bootstrap credentials (temporary)
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 37 | Temporary HA peer password | Yes | - | Clear-text, single-use password for t128 on node0. Valid only while node1 joins, between the MOP steps that open and close HA peer access. Use a unique, strong value. Placeholder: `<input-temporary-ha-peer-password>` | `conductor-node1-cloud-init.txt: initializer-overrides.unsafe-ha-peer-password`<br>`MOP.md: open HA peer access (temporary t128 password on node0)` |
+| 39 | Temporary HA peer password | Yes | - | Clear-text, single-use password for t128 on node0. Valid only while node1 joins, between the MOP steps that open and close HA peer access. Use a unique, strong value. Placeholder: `<input-temporary-ha-peer-password>` | `conductor-node1-cloud-init.txt: initializer-overrides.unsafe-ha-peer-password`<br>`MOP.md: open HA peer access (temporary t128 password on node0)` |
 
 #### Optional settings
 
 | # | Input | Required | Default | Description | File: key |
 |---|---|---|---|---|---|
-| 38 | DNS servers | No | (empty) | Comma separated IPv4 DNS servers. Empty = bootstrapper defaults (8.8.8.8, 1.1.1.1). Azure DNS is 168.63.129.16. | `conductor-node0-cloud-init.txt: dns-servers`<br>`conductor-node1-cloud-init.txt: dns-servers` |
-| 39 | NTP servers | No | (empty) | Comma separated NTP servers (IP or hostname). Empty = bootstrapper defaults. | `conductor-node0-cloud-init.txt: ntp-servers`<br>`conductor-node1-cloud-init.txt: ntp-servers` |
-| 40 | Timezone | No | (empty) | Optional IANA timezone for both nodes, e.g. America/New_York. | `conductor-node0-cloud-init.txt: initializer-overrides.timezone`<br>`conductor-node1-cloud-init.txt: initializer-overrides.timezone` |
-| 41 | Customer / project name | No | (empty) | Shown in the MOP title and summary. | `MOP.md: title` |
+| 40 | DNS servers | No | (empty) | Comma separated IPv4 DNS servers. Empty = bootstrapper defaults (8.8.8.8, 1.1.1.1). Azure DNS is 168.63.129.16. | `conductor-node0-cloud-init.txt: dns-servers`<br>`conductor-node1-cloud-init.txt: dns-servers` |
+| 41 | NTP servers | No | (empty) | Comma separated NTP servers (IP or hostname). Empty = bootstrapper defaults. | `conductor-node0-cloud-init.txt: ntp-servers`<br>`conductor-node1-cloud-init.txt: ntp-servers` |
+| 42 | Timezone | No | (empty) | Optional IANA timezone for both nodes, e.g. America/New_York. | `conductor-node0-cloud-init.txt: initializer-overrides.timezone`<br>`conductor-node1-cloud-init.txt: initializer-overrides.timezone` |
+| 43 | Customer / project name | No | (empty) | Shown in the MOP title and summary. | `MOP.md: title` |
 <!-- INPUTS-TABLE:END -->
 
-Values that are **not inputs** but are fixed by design: `mode: conductor`, `cloud-provider: azure`, `node-name` (`node0`/`node1`), the VM admin user `t128` (also the HA peer user), `ha-peer-name: node0` and `learn-from-ha-peer: true` on node1, and the `customData` template parameter (the cloud-init file itself).
+Values that are **not inputs** but are fixed by design: `mode: conductor`, `cloud-provider: azure`, the top-level `node-name` (`node0`/`node1`, required by the bootstrapper's schema; the SSR node names are inputs), the VM admin user `t128` (also the HA peer user), `ha-peer-name` (node0's SSR node name) and `learn-from-ha-peer: true` on node1, and the `customData` template parameter (the cloud-init file itself).
 
 ### Generating password hashes
 

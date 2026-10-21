@@ -1,5 +1,6 @@
 #cloud-config
 # SSR HA conductor node0 - primary. Initialized standalone, node1 joins it later.
+# SSR node name: node0 (initializer-overrides.node-name; the top-level node-name must stay node0)
 # Pass to the deployment with: --parameters customData=@<this file>
 write_files:
   - path: /etc/128T-hardware-bootstrapper/onboarding-config.json
@@ -20,6 +21,7 @@ write_files:
         "pdc-key-comment": "Conductor-node0",
         "initializer-overrides": {
           "router-name": "Conductor",
+          "node-name": "node0",
           "node-ip": "<input-node0-private-ip>"
         }
       }

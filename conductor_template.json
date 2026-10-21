@@ -373,6 +373,11 @@
           }
         },
         "availabilitySet": "[if(empty(parameters('availabilitySetName')), json('null'), createObject('id', variables('availabilitySetRef')))]",
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        },
         "networkProfile": {
           "networkInterfaces": [
             {

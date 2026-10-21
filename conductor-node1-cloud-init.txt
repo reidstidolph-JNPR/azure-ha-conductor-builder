@@ -1,5 +1,6 @@
 #cloud-config
 # SSR HA conductor node1 - secondary. Learns the setup from node0 over SSH (learn-from-ha-peer).
+# SSR node name: node1 (initializer-overrides.node-name; the top-level node-name must stay node1)
 # Pass to the deployment with: --parameters customData=@<this file>
 write_files:
   - path: /etc/128T-hardware-bootstrapper/onboarding-config.json
@@ -20,6 +21,7 @@ write_files:
         "pdc-key-comment": "Conductor-node1",
         "initializer-overrides": {
           "router-name": "Conductor",
+          "node-name": "node1",
           "node-ip": "<input-node1-private-ip>",
           "ha-peer-ip": "<input-node0-private-ip>",
           "ha-peer-name": "node0",
