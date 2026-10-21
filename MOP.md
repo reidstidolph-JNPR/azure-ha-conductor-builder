@@ -9,6 +9,7 @@ This procedure deploys a two-node highly available Session Smart conductor (node
 | Resource group | `<input-your-resource-group>` |
 | Region | `<input-your-azure-region>` |
 | VNet / subnet | `<input-your-vnet-name>` / `<input-your-subnet-name>` |
+| Managed identity | `<input-your-managed-identity-name>` |
 | node0 | VM `conductor-node0`, IP `<input-node0-private-ip>`, zone 1 |
 | node1 | VM `conductor-node1`, IP `<input-node1-private-ip>`, zone 2 |
 | Public IPs | no |

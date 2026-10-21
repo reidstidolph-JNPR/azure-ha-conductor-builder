@@ -21,10 +21,13 @@
   const AZ_NAME = /^[A-Za-z0-9][A-Za-z0-9._()-]{0,88}[A-Za-z0-9_()-]$|^[A-Za-z0-9]$/;
 
   const re = (regex, message) => (v) => (regex.test(v) ? null : message);
+  /* node1's own region, VNet, subnet and identity only apply while it has its own resource group. */
+  const NODE1_OWN_RG = { field: 'node1ResourceGroup', set: true };
 
   const SECTIONS = [
-    { id: 'azure', title: 'Azure deployment (shared by both nodes)' },
+    { id: 'azure', title: 'Azure deployment (both nodes; node1 can override some below)' },
     { id: 'nodes', title: 'Conductor nodes' },
+    { id: 'node1rg', title: 'node1 in its own resource group (optional)' },
     { id: 'ssr', title: 'SSR software and conductor identity' },
     { id: 'creds', title: 'Account passwords (SHA-512 crypt hashes)' },
     { id: 'ha', title: 'HA peer bootstrap credentials (temporary)' },
@@ -33,27 +36,29 @@
 
   /* kind: text | textarea | select | checkbox | secret | hash
    * ph: placeholder written into files when a required value is empty
-   * when: { field, equals } - the field only applies (and is only required) when another field has that value
+   * when: { field, equals } or { field, set: true } - the field only applies (and is only required) when another
+   *   field has that value, or is not empty
+   * fallback: (values) => value used when the field is left empty (shown as its placeholder in the form)
    * select options: strings, or { value, label } */
   const FIELDS = [
     {
       id: 'resourceGroup', section: 'azure', label: 'Resource group', kind: 'text', required: true,
       ph: '<input-your-resource-group>',
       help: 'Existing resource group the conductor VMs, NICs, NSGs (and optional public IPs) are created in. node1 uses it too unless "node1 resource group" is set.',
-      usedIn: [`${F.mop}: --resource-group of node0 az commands (and node1's by default)`, `${F.p1}: virtualNetworkResourceGroup, managedIdentityResourceGroup (when node1 has its own resource group and these are empty)`],
+      usedIn: [`${F.mop}: --resource-group of node0 az commands (and node1's by default)`, `${F.p1}: virtualNetworkResourceGroup, managedIdentityResourceGroup (when node1 has its own resource group but uses node0's VNet or identity)`],
       validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
     {
       id: 'location', section: 'azure', label: 'Azure region', kind: 'text', required: true,
       ph: '<input-your-azure-region>',
-      help: 'Region of the VNet, lowercase with no spaces (e.g. eastus, westeurope).',
+      help: 'Region of the VNet, lowercase with no spaces (e.g. eastus, westeurope). Also node1\'s region unless node1 has its own.',
       usedIn: [`${F.p0}: location`, `${F.p1}: location`],
       validate: re(/^[a-z0-9]+$/, 'Use the region short name, e.g. eastus'),
     },
     {
       id: 'virtualNetworkName', section: 'azure', label: 'VNet name', kind: 'text', required: true,
       ph: '<input-your-vnet-name>',
-      help: 'Existing VNet both conductor nodes are attached to.',
+      help: 'Existing VNet the conductor nodes are attached to (node1 too, unless it has its own).',
       usedIn: [`${F.p0}: virtualNetworkName`, `${F.p1}: virtualNetworkName`],
       validate: re(AZ_NAME, 'Not a valid VNet name'),
     },
@@ -66,14 +71,14 @@
     {
       id: 'controlSubnetName', section: 'azure', label: 'Control subnet name', kind: 'text', required: true,
       ph: '<input-your-subnet-name>',
-      help: 'Existing subnet for the control interface of both nodes. Routers must reach it; both nodes must reach each other.',
+      help: 'Existing subnet for the control interface of node0, and of node1 unless it has its own. Routers must reach it; both nodes must reach each other.',
       usedIn: [`${F.p0}: controlSubnetName`, `${F.p1}: controlSubnetName`],
       validate: re(AZ_NAME, 'Not a valid subnet name'),
     },
     {
       id: 'managedIdentity', section: 'azure', label: 'User assigned managed identity', kind: 'text', required: true,
       ph: '<input-your-managed-identity-name>',
-      help: 'Identity attached to both VMs. Needs Microsoft.Compute/virtualMachines/read, Microsoft.Network/networkInterfaces/read and Microsoft.Network/virtualNetworks/read.',
+      help: 'Identity attached to the VMs (node1 too, unless it has its own). Needs Microsoft.Compute/virtualMachines/read, Microsoft.Network/networkInterfaces/read and Microsoft.Network/virtualNetworks/read.',
       usedIn: [`${F.p0}: managedIdentity`, `${F.p1}: managedIdentity`],
       validate: re(AZ_NAME, 'Not a valid identity name'),
     },
@@ -166,12 +171,6 @@
       validate: re(VM_NAME, 'Not a valid Azure VM name'),
     },
     {
-      id: 'node1ResourceGroup', section: 'nodes', label: 'node1 resource group', kind: 'text', def: '',
-      help: 'Existing resource group for node1\'s VM, NIC, NSG (and public IP) when it differs from node0\'s. Empty = same resource group as node0. The VNet and managed identity are still looked up in node0\'s resource group unless their own resource group is set.',
-      usedIn: [`${F.mop}: --resource-group of node1 az commands`],
-      validate: re(AZ_NAME, 'Not a valid resource group name'),
-    },
-    {
       id: 'node1PrivateIp', section: 'nodes', label: 'node1 private IP', kind: 'text', required: true,
       ph: '<input-node1-private-ip>',
       help: 'Free static IP in the control subnet for node1.',
@@ -191,6 +190,61 @@
       help: 'Existing public IP for node1, with the same requirements as node0\'s. Must differ from node0\'s.',
       usedIn: [`${F.p1}: existingPublicIpName`],
       validate: re(AZ_NAME, 'Not a valid public IP name'),
+    },
+
+    {
+      id: 'node1ResourceGroup', section: 'node1rg', label: 'node1 resource group', kind: 'text', def: '',
+      help: 'Existing resource group for node1\'s VM, NIC, NSG (and public IP) when it differs from node0\'s. Empty = same resource group as node0. When set, node1 can also use its own region, VNet, subnet and managed identity below.',
+      usedIn: [`${F.mop}: --resource-group of node1 az commands`],
+      validate: re(AZ_NAME, 'Not a valid resource group name'),
+    },
+    {
+      id: 'node1Location', section: 'node1rg', label: 'node1 Azure region', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => resolve(values, 'location'),
+      help: 'Region of node1\'s VNet when it differs from node0\'s. Empty = node0\'s region. A different region needs its own VNet.',
+      usedIn: [`${F.p1}: location`],
+      validate: re(/^[a-z0-9]+$/, 'Use the region short name, e.g. westus2'),
+    },
+    {
+      id: 'node1VirtualNetworkName', section: 'node1rg', label: 'node1 VNet name', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => resolve(values, 'virtualNetworkName'),
+      help: 'Existing VNet for node1 when it differs from node0\'s. Empty = node0\'s VNet. Separate VNets must be peered (or otherwise connected) so the nodes reach each other on their private IPs.',
+      usedIn: [`${F.p1}: virtualNetworkName`],
+      validate: re(AZ_NAME, 'Not a valid VNet name'),
+    },
+    {
+      id: 'node1VirtualNetworkResourceGroup', section: 'node1rg', label: 'node1 VNet resource group', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => linkedResourceGroup(values, 1, 'virtualNetwork', true),
+      help: 'Resource group of node1\'s VNet. Empty = node1\'s resource group when node1 VNet name is set, otherwise the resource group of node0\'s VNet.',
+      usedIn: [`${F.p1}: virtualNetworkResourceGroup`],
+      validate: re(AZ_NAME, 'Not a valid resource group name'),
+    },
+    {
+      id: 'node1ControlSubnetName', section: 'node1rg', label: 'node1 control subnet name', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => resolve(values, 'controlSubnetName'),
+      help: 'Existing subnet in node1\'s VNet for node1\'s control interface. Empty = same subnet name as node0.',
+      usedIn: [`${F.p1}: controlSubnetName`],
+      validate: re(AZ_NAME, 'Not a valid subnet name'),
+    },
+    {
+      id: 'node1ManagedIdentity', section: 'node1rg', label: 'node1 user assigned managed identity', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => resolve(values, 'managedIdentity'),
+      help: 'Identity attached to node1 when it differs from node0\'s, with the same read permissions. Empty = node0\'s identity.',
+      usedIn: [`${F.p1}: managedIdentity`],
+      validate: re(AZ_NAME, 'Not a valid identity name'),
+    },
+    {
+      id: 'node1ManagedIdentityResourceGroup', section: 'node1rg', label: 'node1 managed identity resource group', kind: 'text', def: '',
+      when: NODE1_OWN_RG,
+      fallback: (values) => linkedResourceGroup(values, 1, 'managedIdentity', true),
+      help: 'Resource group of node1\'s identity. Empty = node1\'s resource group when node1 managed identity is set, otherwise the resource group of node0\'s identity.',
+      usedIn: [`${F.p1}: managedIdentityResourceGroup`],
+      validate: re(AZ_NAME, 'Not a valid resource group name'),
     },
 
     {
@@ -293,7 +347,8 @@
 
   function isActive(values, id) {
     const w = FIELD_BY_ID[id].when;
-    return !w || values[w.field] === w.equals;
+    if (!w) return true;
+    return w.set ? String(values[w.field] ?? '').trim() !== '' : values[w.field] === w.equals;
   }
 
   /* Maps inputs saved by earlier versions onto the current fields. */
@@ -328,17 +383,70 @@
     return (node === 1 && resolve(values, 'node1ResourceGroup')) || resolve(values, 'resourceGroup');
   }
 
-  /* True when node1 is deployed to a different resource group than node0 (names are case-insensitive). */
+  /* Azure resource names are case-insensitive. */
+  const sameName = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+
+  /* True when node1 is deployed to a different resource group than node0. */
   function separateResourceGroups(values) {
-    return nodeResourceGroup(values, 0).toLowerCase() !== nodeResourceGroup(values, 1).toLowerCase();
+    return !sameName(nodeResourceGroup(values, 0), nodeResourceGroup(values, 1));
   }
 
-  /* Resource group of a resource shared by both nodes (VNet, identity) as written to a node's params file:
-   * '' lets the template use the node's own resource group, which is only right when that is node0's. */
-  function sharedResourceGroup(values, id, node) {
-    const set = resolve(values, id);
-    if (set) return set;
-    return node === 1 && separateResourceGroups(values) ? nodeResourceGroup(values, 0) : '';
+  /* node1 inputs that replace node0's value for node1 (only while node1 has its own resource group). */
+  const NODE1_OVERRIDE = {
+    location: 'node1Location',
+    virtualNetworkName: 'node1VirtualNetworkName',
+    virtualNetworkResourceGroup: 'node1VirtualNetworkResourceGroup',
+    controlSubnetName: 'node1ControlSubnetName',
+    managedIdentity: 'node1ManagedIdentity',
+    managedIdentityResourceGroup: 'node1ManagedIdentityResourceGroup',
+  };
+
+  /* A node's region, VNet name, subnet name or identity name: node1's own value, or node0's. */
+  function nodeSetting(values, node, id) {
+    return (node === 1 && resolve(values, NODE1_OVERRIDE[id])) || resolve(values, id);
+  }
+
+  /* Effective resource group of a node's VNet (kind 'virtualNetwork') or managed identity ('managedIdentity').
+   * Empty node1 value: node1's resource group if node1 names its own VNet/identity, else wherever node0's one is.
+   * ignoreOverride computes that default without node1's own resource group input (for its placeholder). */
+  function linkedResourceGroup(values, node, kind, ignoreOverride = false) {
+    const rgId = `${kind}ResourceGroup`;
+    if (node === 0) return resolve(values, rgId) || nodeResourceGroup(values, 0);
+    const own = ignoreOverride ? '' : resolve(values, NODE1_OVERRIDE[rgId]);
+    if (own) return own;
+    const nameId = kind === 'virtualNetwork' ? 'virtualNetworkName' : 'managedIdentity';
+    return resolve(values, NODE1_OVERRIDE[nameId]) ? nodeResourceGroup(values, 1) : linkedResourceGroup(values, 0, kind);
+  }
+
+  /* Template *ResourceGroup parameter of a node: '' means the node's own (deployment) resource group. */
+  function linkedResourceGroupParam(values, node, kind) {
+    if (node === 0 || !resolve(values, 'node1ResourceGroup')) return resolve(values, `${kind}ResourceGroup`);
+    const rg = linkedResourceGroup(values, 1, kind);
+    return sameName(rg, nodeResourceGroup(values, 1)) ? '' : rg;
+  }
+
+  function separateRegions(values) {
+    return !sameName(nodeSetting(values, 0, 'location'), nodeSetting(values, 1, 'location'));
+  }
+
+  function separateVnets(values) {
+    return !sameName(nodeSetting(values, 0, 'virtualNetworkName'), nodeSetting(values, 1, 'virtualNetworkName'))
+      || !sameName(linkedResourceGroup(values, 0, 'virtualNetwork'), linkedResourceGroup(values, 1, 'virtualNetwork'));
+  }
+
+  function separateSubnets(values) {
+    return separateVnets(values) || !sameName(nodeSetting(values, 0, 'controlSubnetName'), nodeSetting(values, 1, 'controlSubnetName'));
+  }
+
+  function separateIdentities(values) {
+    return !sameName(nodeSetting(values, 0, 'managedIdentity'), nodeSetting(values, 1, 'managedIdentity'))
+      || !sameName(linkedResourceGroup(values, 0, 'managedIdentity'), linkedResourceGroup(values, 1, 'managedIdentity'));
+  }
+
+  /* Placeholder text of a field with a fallback, for the form. */
+  function fallbackValue(values, id) {
+    const f = FIELD_BY_ID[id];
+    return f.fallback ? f.fallback(values) : null;
   }
 
   function onboardingConfig(values, node) {
@@ -410,16 +518,16 @@
       $schema: 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#',
       contentVersion: '1.0.0.0',
       parameters: {
-        location: p(s('location')),
+        location: p(nodeSetting(values, node, 'location')),
         instanceName: p(s(`${self}VmName`)),
         instanceSize: p(s('instanceSize')),
         availabilityZone: p(s(`${self}Zone`)),
         availabilitySetName: p(s('availabilitySetName')),
-        managedIdentity: p(s('managedIdentity')),
-        managedIdentityResourceGroup: p(sharedResourceGroup(values, 'managedIdentityResourceGroup', node)),
-        virtualNetworkName: p(s('virtualNetworkName')),
-        virtualNetworkResourceGroup: p(sharedResourceGroup(values, 'virtualNetworkResourceGroup', node)),
-        controlSubnetName: p(s('controlSubnetName')),
+        managedIdentity: p(nodeSetting(values, node, 'managedIdentity')),
+        managedIdentityResourceGroup: p(linkedResourceGroupParam(values, node, 'managedIdentity')),
+        virtualNetworkName: p(nodeSetting(values, node, 'virtualNetworkName')),
+        virtualNetworkResourceGroup: p(linkedResourceGroupParam(values, node, 'virtualNetwork')),
+        controlSubnetName: p(nodeSetting(values, node, 'controlSubnetName')),
         controlPrivateIp: p(s(`${self}PrivateIp`)),
         haPeerPrivateIp: p(s(`${peer}PrivateIp`)),
         createPublicIp: p(publicIp(values, node).mode === 'create'),
@@ -716,7 +824,6 @@
       ...cols.flatMap((c) => [c.title.length + 6, ...[...c.ssr, ...c.nic].map((l) => l.length + 4)]),
       LINK + 1 + linkLabel.length,
     );
-    const total = width * 2 + GAP;
     const haRow = 1 + cols[0].ssr.indexOf('');
     const gap = (i) => {
       if (i === haRow) return 'HA sync'.padStart(11).padEnd(GAP);
@@ -727,28 +834,44 @@
     const vms = cols.map((c) => diagramBox(c.title, c.ssr, width, { down: LINK }));
     const nics = cols.map((c) => diagramBox('', c.nic, width, { up: LINK, down: LINK }));
     const link = `${' '.repeat(LINK)}│${linkLabel}`.padEnd(width);
-    const bus = '═'.repeat(total).split('');
+    const ownVnets = separateVnets(values);
+    const ownSubnets = separateSubnets(values);
+    const bus = `${'═'.repeat(width)}${ownVnets ? '<── peered ──>' : '═'.repeat(GAP)}${'═'.repeat(width)}`.split('');
     bus[LINK] = '╧';
     bus[width + GAP + LINK] = '╧';
 
-    const vnetRg = sharedResourceGroup(values, 'virtualNetworkResourceGroup', 1);
     const created = `VM, NIC, NSG${mode === 'create' ? ', public IP' : ''}`;
-    const rgText = separateResourceGroups(values)
-      ? `node0 in resource group ${nodeResourceGroup(values, 0)}, node1 in resource group ${nodeResourceGroup(values, 1)}`
-      : `Resource group ${s('resourceGroup')}`;
+    const region = (n) => nodeSetting(values, n, 'location');
+    let rgText;
+    if (separateResourceGroups(values) || separateRegions(values)) {
+      const where = (n) => `node${n} in resource group ${nodeResourceGroup(values, n)}${separateRegions(values) ? ` (${region(n)})` : ''}`;
+      rgText = `${where(0)}, ${where(1)}${separateRegions(values) ? '' : ` (${region(0)})`}`;
+    } else {
+      rgText = `Resource group ${s('resourceGroup')} (${region(0)})`;
+    }
+    const subnetOf = (n) => `subnet ${nodeSetting(values, n, 'controlSubnetName')} in VNet ${nodeSetting(values, n, 'virtualNetworkName')}`
+      + ` (existing, resource group ${linkedResourceGroup(values, n, 'virtualNetwork')})`;
+    let subnetLines;
+    if (ownSubnets) {
+      subnetLines = [` node0: ${subnetOf(0)}`, ` node1: ${subnetOf(1)}`];
+      if (ownVnets) subnetLines.push(' The VNets are peered (or otherwise connected) so the nodes reach each other on their private IPs.');
+    } else {
+      const vnetRg = s('virtualNetworkResourceGroup') || separateResourceGroups(values) ? linkedResourceGroup(values, 0, 'virtualNetwork') : '';
+      subnetLines = [` Subnet ${s('controlSubnetName')} in VNet ${s('virtualNetworkName')} (existing${vnetRg ? `, resource group ${vnetRg}` : ''})`];
+    }
     const nsgRows = [
       ['routers', 'TCP 930, 933, 4505-4506', `from ${s('controlAllowedCidr')}`],
       ['admins', 'TCP 22, 443', `from ${s('adminAllowedCidr')}`],
       ['HA peer', 'all ports', 'from the other node\'s IP only (/32)'],
     ];
     return [
-      `${rgText} (${s('location')}) - created per node: ${created}`,
+      `${rgText} - created per node: ${created}`,
       '',
       ...pair(vms[0], vms[1], gap),
       pair([link], [link])[0],
       ...pair(nics[0], nics[1]),
       bus.join(''),
-      ` Subnet ${s('controlSubnetName')} in VNet ${s('virtualNetworkName')} (existing${vnetRg ? `, resource group ${vnetRg}` : ''})`,
+      ...subnetLines,
       ` Inbound, allowed by each node's NSG${mode === 'none' ? '' : ' (private and public IP)'}:`,
       ...nsgRows.map(([who, ports, from]) => `   ${who.padEnd(9)}${ports.padEnd(25)}${from}`),
       ' Outbound: HTTPS to the SSR software repository (install and upgrades)',
@@ -769,6 +892,16 @@
     const rgDetail = separateResourceGroups(values)
       ? ` node0 is in resource group ${c(nodeResourceGroup(values, 0))}, node1 in ${c(nodeResourceGroup(values, 1))}.`
       : '';
+    const regionDetail = separateRegions(values)
+      ? ` node0 runs in region ${c(nodeSetting(values, 0, 'location'))}, node1 in ${c(nodeSetting(values, 1, 'location'))}.`
+      : '';
+    const identityDetail = separateIdentities(values)
+      ? ` node0 uses managed identity ${c(nodeSetting(values, 0, 'managedIdentity'))}, node1 ${c(nodeSetting(values, 1, 'managedIdentity'))}.`
+      : '';
+    const subnetOf = (n) => `subnet ${c(nodeSetting(values, n, 'controlSubnetName'))} in VNet ${c(nodeSetting(values, n, 'virtualNetworkName'))} (resource group ${c(linkedResourceGroup(values, n, 'virtualNetwork'))})`;
+    const networkRow = separateSubnets(values)
+      ? [`node0: ${subnetOf(0)}; node1: ${subnetOf(1)}`, `Existing, not created by the template. Each subnet needs outbound HTTPS for the SSR download.${separateVnets(values) ? ' The two VNets must be peered (or otherwise connected), and their NSGs and routes must allow traffic between the two node IPs.' : ' Traffic between the two nodes must be allowed.'}`]
+      : [`VNet ${c(s('virtualNetworkName'))}, subnet ${c(s('controlSubnetName'))}`, 'Existing, not created by the template. Needs outbound HTTPS for the SSR download and must allow traffic between the two nodes.'];
     const pip = [publicIp(values, 0), publicIp(values, 1)];
     const pipNames = pip.map((p) => c(p.name)).join(' / ');
     const pipRg = s('publicIpResourceGroup');
@@ -778,7 +911,7 @@
       existing: [`Existing public IPs ${pipNames}${pipRg ? ` (resource group ${c(pipRg)})` : ''}`, 'Already created; the template only attaches them to the NICs, and the MOP rollback does not delete them. Use them when routers or administrators reach the conductor over the Internet; the NSG rules apply to them too.'],
     }[pip[0].mode];
     return [
-      'Each SSR conductor node is one Azure VM with a **single NIC** in the same existing subnet. Inside the VM, SSR sees that NIC as `ge-0-0`, and it carries both the conductor (control) traffic from managed routers and the HA sync between the two nodes. No separate HA sync or fabric NIC is deployed.',
+      `Each SSR conductor node is one Azure VM with a **single NIC** in ${separateSubnets(values) ? 'an existing subnet' : 'the same existing subnet'}. Inside the VM, SSR sees that NIC as \`ge-0-0\`, and it carries both the conductor (control) traffic from managed routers and the HA sync between the two nodes. No separate HA sync or fabric NIC is deployed.`,
       '',
       `${FENCE}text`,
       topologyDiagram(values),
@@ -786,14 +919,14 @@
       '',
       '| SSR term (inside the VM) | Azure resource (outside the VM) | Details |',
       '|---|---|---|',
-      `| Conductor router ${c(router)}, nodes ${c('node0')} / ${c('node1')} | VMs ${c(vm[0])} / ${c(vm[1])}${whereText} | One VM per node from the BYOL marketplace image, deployed from the same ARM template.${rgDetail} Hostnames ${c(`${router}-node0`)} / ${c(`${router}-node1`)}. |`,
+      `| Conductor router ${c(router)}, nodes ${c('node0')} / ${c('node1')} | VMs ${c(vm[0])} / ${c(vm[1])}${whereText} | One VM per node from the BYOL marketplace image, deployed from the same ARM template.${rgDetail}${regionDetail}${identityDetail} Hostnames ${c(`${router}-node0`)} / ${c(`${router}-node1`)}. |`,
       `| Interface ${c('ge-0-0')} | NICs ${nic} | The only NIC on each VM, so SSR names it ${c('ge-0-0')} (NICs become ${c('ge-0-0')}, ${c('ge-0-1')}, ... in attach order). Tagged ${c('SSR-ROLE=MGMT')}; accelerated networking and IP forwarding enabled. |`,
       `| Node IP (${c('node-ip')}), the conductor address | Static private IPs ${c(ip[0])} / ${c(ip[1])} | The NIC IP (template ${c('controlPrivateIp')}) and the cloud-init ${c('node-ip')} are the same value. Managed routers connect to both addresses. |`,
       `| HA sync interface (node1 ${c('ha-peer-ip')} = ${c(ip[0])}) | Same NIC and IP; no HA sync NIC | Conductor-to-conductor sync runs over ${c('ge-0-0')} through the subnet. Hardware conductors use a dedicated HA sync NIC on ${c('169.254.253.x')} (${c('clustered')}), which an Azure VNet cannot carry. |`,
       `| HA fabric interface | None | Conductors do not forward session traffic, so there is no fabric link. |`,
       `| - | NSGs ${nic}, one per NIC | Inbound allow: TCP 22, 443 from ${c(s('adminAllowedCidr'))}; TCP 930 (router control), 933 (secure onboarding), 4505-4506 (salt) from ${c(s('controlAllowedCidr'))}; all traffic from the HA peer's IP. |`,
       `| - | ${publicIpRow[0]} | ${publicIpRow[1]} |`,
-      `| - | VNet ${c(s('virtualNetworkName'))}, subnet ${c(s('controlSubnetName'))} | Existing, not created by the template. Needs outbound HTTPS for the SSR download and must allow traffic between the two nodes. |`,
+      `| - | ${networkRow[0]} | ${networkRow[1]} |`,
     ].join('\n');
   }
 
@@ -815,7 +948,18 @@
       existing: `existing, attached to node0 / node1: ${pipNames} ${pipWhere}`,
     }[pip[0].mode];
     const prereqPublicIp = pip[0].mode === 'existing'
-      ? [`- The existing public IPs ${pipNames} are ${pipWhere} and region \`${s('location')}\`, are Standard SKU with static allocation, are not attached to any other resource, and are zone-redundant or in their node's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on them.`]
+      ? [`- The existing public IPs ${pipNames} are ${pipWhere} and ${separateRegions(values) ? 'in their node\'s region' : `region \`${s('location')}\``}, are Standard SKU with static allocation, are not attached to any other resource, and are zone-redundant or in their node's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on them.`]
+      : [];
+    const perNode = (separate, value) => (separate ? `node0 ${value(0)}, node1 ${value(1)}` : value(0));
+    const code = (x) => `\`${x}\``;
+    const ownVnets = separateVnets(values);
+    const ownSubnets = separateSubnets(values);
+    const ownIdentities = separateIdentities(values);
+    const existText = split || ownSubnets || ownIdentities
+      ? `- The resource group${split ? 's' : ''}, VNet${ownVnets ? 's' : ''}, subnet${ownSubnets ? 's' : ''} and managed identit${ownIdentities ? 'ies' : 'y'} listed above exist. Each node IP is free in its node's subnet.`
+      : '- The resource group, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.';
+    const prereqPeering = ownVnets
+      ? [`- The VNets \`${nodeSetting(values, 0, 'virtualNetworkName')}\` and \`${nodeSetting(values, 1, 'virtualNetworkName')}\` are peered (or otherwise connected), and nothing between them blocks traffic between \`${s('node0PrivateIp')}\` and \`${s('node1PrivateIp')}\`.`]
       : [];
     const out = [
       `# MOP: Highly available SSR conductor in Azure${customer ? ` - ${customer}` : ''}`,
@@ -827,8 +971,9 @@
       '| Item | Value |',
       '|---|---|',
       split ? `| Resource groups | node0 \`${rg[0]}\`, node1 \`${rg[1]}\` |` : `| Resource group | \`${rg[0]}\` |`,
-      `| Region | \`${s('location')}\` |`,
-      `| VNet / subnet | \`${s('virtualNetworkName')}\` / \`${s('controlSubnetName')}\` |`,
+      `| Region | ${perNode(separateRegions(values), (n) => code(nodeSetting(values, n, 'location')))} |`,
+      `| VNet / subnet | ${perNode(ownSubnets, (n) => `${code(nodeSetting(values, n, 'virtualNetworkName'))} / ${code(nodeSetting(values, n, 'controlSubnetName'))}`)} |`,
+      `| Managed identity | ${perNode(ownIdentities, (n) => code(nodeSetting(values, n, 'managedIdentity')))} |`,
       `| node0 | VM \`${s('node0VmName')}\`, IP \`${s('node0PrivateIp')}\`, zone ${zone(0)} |`,
       `| node1 | VM \`${s('node1VmName')}\`, IP \`${s('node1PrivateIp')}\`, zone ${zone(1)} |`,
       `| Public IPs | ${publicIpText} |`,
@@ -841,8 +986,11 @@
       '',
       '## Prerequisites',
       '',
-      `- The resource group${split ? 's' : ''}, VNet, subnet and managed identity listed above exist. The two node IPs are free in the subnet.`,
-      '- The subnet has outbound HTTPS access to download the SSR software, and allows traffic between the two nodes.',
+      existText,
+      ownSubnets
+        ? '- Each subnet has outbound HTTPS access to download the SSR software, and allows traffic between the two nodes.'
+        : '- The subnet has outbound HTTPS access to download the SSR software, and allows traffic between the two nodes.',
+      ...prereqPeering,
       ...prereqPublicIp,
       `- Azure Cloud Shell (PowerShell) with permission to deploy to ${split ? 'both resource groups' : 'the resource group'}.`,
       '- The five deployment files below, uploaded to one Cloud Shell directory (Manage files > Upload). Run every Cloud Shell command from that directory.',
@@ -972,6 +1120,12 @@
     }
     if (v('availabilitySetName') && v('node1ResourceGroup') && v('node1ResourceGroup').toLowerCase() !== v('resourceGroup').toLowerCase()) {
       fieldErrors.node1ResourceGroup = 'An availability set needs both VMs in its resource group; clear this or the availability set';
+    }
+    if (v('node1ResourceGroup') && v('node1Location') && separateRegions(values) && !separateVnets(values)) {
+      fieldErrors.node1VirtualNetworkName = 'node1 is in another region, so it needs a VNet in that region';
+    }
+    if (separateVnets(values)) {
+      warnings.push('node0 and node1 are in different VNets: peer them (or otherwise connect them) so the nodes reach each other on their private IPs.');
     }
     if (v('node0Zone') && v('node0Zone') === v('node1Zone')) {
       warnings.push('node0 and node1 are in the same availability zone; use different zones for zone redundancy.');
@@ -1258,6 +1412,9 @@
     resolve,
     nodeResourceGroup,
     separateResourceGroups,
+    nodeSetting,
+    linkedResourceGroup,
+    fallbackValue,
     onboardingConfig,
     buildGeneratedFiles,
     buildAllFiles,

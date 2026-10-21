@@ -190,6 +190,7 @@
       const msg = fieldErrors[f.id] || '';
       $(`#e-${f.id}`).textContent = msg;
       $(`#w-${f.id}`).hidden = !G.isActive(state.values, f.id);
+      if (f.fallback) $(`#f-${f.id}`).placeholder = `default: ${G.fallbackValue(state.values, f.id)}`;
       $(`#w-${f.id}`).classList.toggle('invalid', Boolean(msg));
       $(`#w-${f.id}`).classList.toggle('missing', missing.includes(f.id));
     }

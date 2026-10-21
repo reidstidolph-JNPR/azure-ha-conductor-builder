@@ -31,7 +31,8 @@ function inputsTable() {
       else if (f.def !== undefined) def = `\`${f.def}\``;
       const ph = f.required ? ` Placeholder: \`${f.ph}\`` : '';
       const used = f.usedIn.map((u) => `\`${cell(u)}\``).join('<br>');
-      const when = f.when ? ` (only when ${G.FIELD_BY_ID[f.when.field].label} = \`${f.when.equals}\`)` : '';
+      const cond = f.when && (f.when.set ? `${G.FIELD_BY_ID[f.when.field].label} is set` : `${G.FIELD_BY_ID[f.when.field].label} = \`${f.when.equals}\``);
+      const when = f.when ? ` (only when ${cond})` : '';
       out.push(`| ${n} | ${text(f.label)} | ${f.required ? 'Yes' : 'No'}${when} | ${def} | ${text(f.help)}${ph} | ${used} |`);
     }
   }
@@ -109,6 +110,7 @@ test('topology diagram is aligned and reflects the inputs', () => {
     Object.assign(filled(), { publicIpMode: 'create', node0Zone: '', node1Zone: '', availabilitySetName: 'cond-avset', node0VmName: 'a-much-longer-conductor-vm-name-0' }),
     Object.assign(filled(), { publicIpMode: 'existing', node0PublicIpName: 'pip-a', node1PublicIpName: 'pip-b' }),
     Object.assign(G.defaults(), { publicIpMode: 'existing' }),
+    Object.assign(filled(), { node1ResourceGroup: 'rg-b', node1Location: 'westus2', node1VirtualNetworkName: 'vnet-b' }),
   ];
   for (const values of variants) {
     const lines = G.topologyDiagram(values).split('\n');
@@ -438,6 +440,63 @@ test('node1 can use its own resource group', () => {
 
   const avset = Object.assign(filled(), { node1ResourceGroup: 'ssr-rg-b', node0Zone: '', node1Zone: '', availabilitySetName: 'set' });
   assert.ok(G.validate(avset).fieldErrors.node1ResourceGroup);
+});
+
+test('node1 in its own resource group can use its own region, VNet, subnet and identity', () => {
+  const params = (values, n) => JSON.parse(G.buildGeneratedFiles(values).find((f) => f.path === G.FILES[`p${n}`]).content).parameters;
+  const pick = (p) => Object.fromEntries(['location', 'virtualNetworkName', 'virtualNetworkResourceGroup', 'controlSubnetName', 'managedIdentity', 'managedIdentityResourceGroup'].map((k) => [k, p[k].value]));
+  const node0Expected = { location: 'eastus', virtualNetworkName: 'ssr-vnet', virtualNetworkResourceGroup: '', controlSubnetName: 'conductor', managedIdentity: 'ssr-id', managedIdentityResourceGroup: '' };
+  const own = {
+    node1Location: 'westus2', node1VirtualNetworkName: 'vnet-b', node1ControlSubnetName: 'conductor-b', node1ManagedIdentity: 'id-b',
+  };
+
+  // node1 overrides are ignored (and hidden) until node1 has its own resource group.
+  const ignored = Object.assign(filled(), own);
+  for (const id of Object.keys(own)) assert.ok(!G.isActive(ignored, id), id);
+  assert.deepStrictEqual(pick(params(ignored, 1)), node0Expected);
+
+  // Own VNet and identity named, resource groups left empty: they live in node1's resource group ('' = deployment RG).
+  const sep = Object.assign(filled(), own, { node1ResourceGroup: 'ssr-rg-b' });
+  assert.deepStrictEqual(G.validate(sep).fieldErrors, {});
+  assert.deepStrictEqual(pick(params(sep, 0)), node0Expected, 'node0 is unaffected');
+  assert.deepStrictEqual(pick(params(sep, 1)), {
+    location: 'westus2', virtualNetworkName: 'vnet-b', virtualNetworkResourceGroup: '', controlSubnetName: 'conductor-b', managedIdentity: 'id-b', managedIdentityResourceGroup: '',
+  });
+  assert.strictEqual(G.fallbackValue(sep, 'node1VirtualNetworkResourceGroup'), 'ssr-rg-b');
+  assert.strictEqual(G.fallbackValue(sep, 'node1Location'), 'eastus');
+  assert.ok(G.validate(sep).warnings.some((w) => /different VNets/.test(w)));
+
+  // Explicit node1 resource groups for its VNet and identity.
+  const explicit = Object.assign(filled(), own, { node1ResourceGroup: 'ssr-rg-b', node1VirtualNetworkResourceGroup: 'net-b', node1ManagedIdentityResourceGroup: 'id-rg-b' });
+  assert.strictEqual(params(explicit, 1).virtualNetworkResourceGroup.value, 'net-b');
+  assert.strictEqual(params(explicit, 1).managedIdentityResourceGroup.value, 'id-rg-b');
+  const sameAsOwn = Object.assign(filled(), own, { node1ResourceGroup: 'ssr-rg-b', node1VirtualNetworkResourceGroup: 'SSR-RG-B' });
+  assert.strictEqual(params(sameAsOwn, 1).virtualNetworkResourceGroup.value, '', 'own resource group stays the template default');
+
+  // Shares node0's VNet but has its own identity: VNet resource group points at node0's, identity at node1's.
+  const shared = Object.assign(filled(), { node1ResourceGroup: 'ssr-rg-b', node1ManagedIdentity: 'id-b' });
+  assert.strictEqual(params(shared, 1).virtualNetworkName.value, 'ssr-vnet');
+  assert.strictEqual(params(shared, 1).virtualNetworkResourceGroup.value, 'ssr-rg');
+  assert.strictEqual(params(shared, 1).managedIdentityResourceGroup.value, '');
+  assert.strictEqual(G.fallbackValue(shared, 'node1VirtualNetworkResourceGroup'), 'ssr-rg');
+
+  // Another region needs another VNet.
+  const regionOnly = Object.assign(filled(), { node1ResourceGroup: 'ssr-rg-b', node1Location: 'westus2' });
+  assert.ok(G.validate(regionOnly).fieldErrors.node1VirtualNetworkName);
+
+  // MOP and diagram show each node's network.
+  const mop = G.mopDocument(sep);
+  assert.ok(mop.includes('| Region | node0 `eastus`, node1 `westus2` |'));
+  assert.ok(mop.includes('| VNet / subnet | node0 `ssr-vnet` / `conductor`, node1 `vnet-b` / `conductor-b` |'));
+  assert.ok(mop.includes('| Managed identity | node0 `ssr-id`, node1 `id-b` |'));
+  assert.ok(mop.includes('- The VNets `ssr-vnet` and `vnet-b` are peered'));
+  const diagram = G.topologyDiagram(sep).split('\n');
+  assert.ok(diagram[0].startsWith('node0 in resource group ssr-rg (eastus), node1 in resource group ssr-rg-b (westus2)'));
+  assert.ok(diagram.some((l) => l.includes('<── peered ──>')));
+  assert.ok(diagram.includes(' node1: subnet conductor-b in VNet vnet-b (existing, resource group ssr-rg-b)'));
+  const single = G.mopDocument(filled());
+  assert.ok(single.includes('| Region | `eastus` |') && single.includes('| Managed identity | `ssr-id` |'));
+  assert.ok(!single.includes('peered'));
 });
 
 test('cross-field validation', () => {
