@@ -4,9 +4,9 @@
 
   const G = window.SsrHa;
   const STATIC_FILES = JSON.parse(document.getElementById('static-files').textContent);
-  /* README.md is the Usage tab; the customer bundle is the MOP plus the five deployment files. */
+  /* README.md is the Usage tab; the customer bundle is the MOP plus the deployment files (five for HA, three standalone). */
   const DEPLOY_FILES = Object.fromEntries(Object.entries(STATIC_FILES).filter(([path]) => path !== 'README.md'));
-  const BUNDLE_DIR = 'ssr-ha-conductor-azure';
+  const bundleDir = () => (G.isStandalone(state.values) ? 'ssr-conductor-azure' : 'ssr-ha-conductor-azure');
   const PLACEHOLDER = /<input-[^>]*>/g;
 
   const state = {
@@ -156,14 +156,14 @@
     form.innerHTML = '';
     for (const section of G.SECTIONS) {
       const fields = G.FIELDS.filter((f) => f.section === section.id);
-      form.append(h('fieldset', {},
+      form.append(h('fieldset', { id: `s-${section.id}` },
         h('legend', {}, section.title),
         fields.map((f) => h('div', { class: `field ${f.kind === 'textarea' ? 'wide' : ''}`, id: `w-${f.id}` },
-          h('label', { for: `f-${f.id}` }, f.label, f.required ? h('span', { class: 'req', title: 'required' }, ' *') : null),
+          h('label', { for: `f-${f.id}` }, h('span', { id: `l-${f.id}` }, f.label), f.required ? h('span', { class: 'req', title: 'required' }, ' *') : null),
           fieldInput(f),
           h('div', { class: 'error', id: `e-${f.id}` }),
-          h('div', { class: 'help' }, f.help),
-          h('div', { class: 'used-in' }, 'Used in: ', f.usedIn.map((u) => h('code', {}, u)))))));
+          h('div', { class: 'help', id: `h-${f.id}` }, f.help),
+          h('div', { class: 'used-in', id: `u-${f.id}` })))));
     }
     writeValuesToForm();
   }
@@ -186,8 +186,22 @@
   function refresh() {
     saveInputs();
     const { fieldErrors, warnings, missing } = G.validate(state.values);
+    for (const section of G.SECTIONS) {
+      const view = G.sectionView(state.values, section.id);
+      const fieldset = $(`#s-${section.id}`);
+      fieldset.hidden = view.hidden;
+      fieldset.querySelector('legend').textContent = view.title;
+    }
     for (const f of G.FIELDS) {
       const msg = fieldErrors[f.id] || '';
+      const view = G.fieldView(state.values, f.id);
+      $(`#l-${f.id}`).textContent = view.label;
+      $(`#h-${f.id}`).textContent = view.help;
+      const usedIn = $(`#u-${f.id}`);
+      usedIn.replaceChildren('Used in: ', ...view.usedIn.map((u) => h('code', {}, u)));
+      if (f.kind === 'select') {
+        for (const o of view.options) if (typeof o !== 'string') $(`#f-${f.id}`).querySelector(`option[value="${o.value}"]`).textContent = o.label;
+      }
       $(`#e-${f.id}`).textContent = msg;
       $(`#w-${f.id}`).hidden = !G.isActive(state.values, f.id);
       if (f.fallback) $(`#f-${f.id}`).placeholder = `default: ${G.fallbackValue(state.values, f.id)}`;
@@ -205,6 +219,8 @@
     );
     if (warnings.length) status.append(h('ul', {}, warnings.map((w) => h('li', {}, w))));
     state.files = G.buildAllFiles(state.values, DEPLOY_FILES);
+    const deployFiles = state.files.length - 1;
+    $('#bundle-note').textContent = `Click a file to review its contents. The bundle is the MOP plus the ${({ 3: 'three', 5: 'five' })[deployFiles] || deployFiles} deployment files${G.isStandalone(state.values) ? ' of a standalone conductor' : ''}.`;
     renderCommands();
     if ($('#files').classList.contains('active')) renderFiles();
   }
@@ -213,12 +229,12 @@
     const list = $('#steps');
     list.innerHTML = '';
     for (const step of G.mopSteps(state.values)) {
-      const where = G.WHERE[step.where];
+      const where = G.whereFor(state.values, step.where);
       list.append(h('li', {},
         h('div', { class: 'step-head' },
           h('strong', {}, step.title),
           h('span', { class: `where where-${step.where}`, title: 'Where to run this command' }, where.label),
-          step.optional ? h('span', { class: 'where optional', title: 'Not required to form the HA pair' }, 'optional') : null,
+          step.optional ? h('span', { class: 'where optional', title: 'Not required to complete the deployment' }, 'optional') : null,
           h('span', { class: 'spacer' }),
           h('button', { class: 'small', onclick: (e) => copyText(step.cmd, e.target) }, 'Copy')),
         h('pre', { class: 'cmd' }, step.cmd),
@@ -547,8 +563,9 @@
   $('#btn-expand-all').addEventListener('click', () => setAllExpanded(true));
   $('#btn-collapse-all').addEventListener('click', () => setAllExpanded(false));
   $('#btn-zip').addEventListener('click', () => {
-    const zip = G.makeZip(state.files.map((f) => ({ path: `${BUNDLE_DIR}/${f.path}`, content: f.content })));
-    download(`${BUNDLE_DIR}.zip`, zip, 'application/zip');
+    const dir = bundleDir();
+    const zip = G.makeZip(state.files.map((f) => ({ path: `${dir}/${f.path}`, content: f.content })));
+    download(`${dir}.zip`, zip, 'application/zip');
   });
   $('#hash-form').addEventListener('submit', applyHash);
   $('#hash-cancel').addEventListener('click', () => $('#hash-dialog').close());

@@ -79,7 +79,7 @@
     "controlSubnetName": {
       "type": "string",
       "metadata": {
-        "description": "Name of an existing subnet in the VNet for the node's control interface. Both HA nodes may share the subnet; the nodes must be able to reach each other."
+        "description": "Name of an existing subnet in the VNet for the node's control interface. In an HA pair both nodes may share the subnet; the nodes must be able to reach each other."
       }
     },
     "controlPrivateIp": {
@@ -91,9 +91,9 @@
     },
     "haPeerPrivateIp": {
       "type": "string",
-      "minLength": 7,
+      "defaultValue": "",
       "metadata": {
-        "description": "Static private IPv4 address of the other conductor node (the HA peer). Used to allow HA peer traffic in this node's NSG."
+        "description": "[OPTIONAL] Static private IPv4 address of the other conductor node (the HA peer). Adds an NSG rule allowing all traffic from it. Leave empty for a standalone (single-node) conductor."
       }
     },
     "createPublicIp": {
@@ -159,6 +159,94 @@
     "attachPublicIp": "[or(variables('createNewPublicIp'), variables('useExistingPublicIp'))]",
     "newPublicIpRef": "[resourceId('Microsoft.Network/publicIPAddresses', concat(parameters('instanceName'), '-control'))]",
     "publicIpRef": "[if(variables('useExistingPublicIp'), resourceId(if(empty(parameters('existingPublicIpResourceGroup')), resourceGroup().name, parameters('existingPublicIpResourceGroup')), 'Microsoft.Network/publicIPAddresses', parameters('existingPublicIpName')), variables('newPublicIpRef'))]",
+    "baseSecurityRules": [
+      {
+        "name": "adminSSH",
+        "properties": {
+          "description": "Allows SSH",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "22",
+          "sourceAddressPrefix": "[parameters('adminAllowedCidr')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 100,
+          "direction": "Inbound"
+        }
+      },
+      {
+        "name": "adminHTTPs",
+        "properties": {
+          "description": "Allows HTTPs",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "443",
+          "sourceAddressPrefix": "[parameters('adminAllowedCidr')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 200,
+          "direction": "Inbound"
+        }
+      },
+      {
+        "name": "control",
+        "properties": {
+          "description": "Allows control connections from Routers",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "930",
+          "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 300,
+          "direction": "Inbound"
+        }
+      },
+      {
+        "name": "secureConductorOnboarding",
+        "properties": {
+          "description": "Allows secure conductor onboarding connections from Routers",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "933",
+          "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 400,
+          "direction": "Inbound"
+        }
+      },
+      {
+        "name": "automatedProvisioner",
+        "properties": {
+          "description": "Allows automatedProvisioner connections from Routers",
+          "protocol": "Tcp",
+          "sourcePortRange": "*",
+          "destinationPortRange": "4505-4506",
+          "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 500,
+          "direction": "Inbound"
+        }
+      }
+    ],
+    "haPeerSecurityRules": [
+      {
+        "name": "haPeer",
+        "properties": {
+          "description": "Allows all traffic from the HA peer conductor node (HA sync, SSH key exchange, salt)",
+          "protocol": "*",
+          "sourcePortRange": "*",
+          "destinationPortRange": "*",
+          "sourceAddressPrefix": "[concat(parameters('haPeerPrivateIp'), '/32')]",
+          "destinationAddressPrefix": "*",
+          "access": "Allow",
+          "priority": 600,
+          "direction": "Inbound"
+        }
+      }
+    ],
     "offer": "session-smart-networking-payg",
     "sku": "session-smart-networking-public-gen2-byol"
   },
@@ -182,92 +270,7 @@
       "name": "[variables('mgmtName')]",
       "location": "[parameters('location')]",
       "properties": {
-        "securityRules": [
-          {
-            "name": "adminSSH",
-            "properties": {
-              "description": "Allows SSH",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "22",
-              "sourceAddressPrefix": "[parameters('adminAllowedCidr')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 100,
-              "direction": "Inbound"
-            }
-          },
-          {
-            "name": "adminHTTPs",
-            "properties": {
-              "description": "Allows HTTPs",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "443",
-              "sourceAddressPrefix": "[parameters('adminAllowedCidr')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 200,
-              "direction": "Inbound"
-            }
-          },
-          {
-            "name": "control",
-            "properties": {
-              "description": "Allows control connections from Routers",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "930",
-              "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 300,
-              "direction": "Inbound"
-            }
-          },
-          {
-            "name": "secureConductorOnboarding",
-            "properties": {
-              "description": "Allows secure conductor onboarding connections from Routers",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "933",
-              "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 400,
-              "direction": "Inbound"
-            }
-          },
-          {
-            "name": "automatedProvisioner",
-            "properties": {
-              "description": "Allows automatedProvisioner connections from Routers",
-              "protocol": "Tcp",
-              "sourcePortRange": "*",
-              "destinationPortRange": "4505-4506",
-              "sourceAddressPrefix": "[parameters('controlAllowedCidr')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 500,
-              "direction": "Inbound"
-            }
-          },
-          {
-            "name": "haPeer",
-            "properties": {
-              "description": "Allows all traffic from the HA peer conductor node (HA sync, SSH key exchange, salt)",
-              "protocol": "*",
-              "sourcePortRange": "*",
-              "destinationPortRange": "*",
-              "sourceAddressPrefix": "[concat(parameters('haPeerPrivateIp'), '/32')]",
-              "destinationAddressPrefix": "*",
-              "access": "Allow",
-              "priority": 600,
-              "direction": "Inbound"
-            }
-          }
-        ]
+        "securityRules": "[if(empty(parameters('haPeerPrivateIp')), variables('baseSecurityRules'), concat(variables('baseSecurityRules'), variables('haPeerSecurityRules')))]"
       }
     },
     {

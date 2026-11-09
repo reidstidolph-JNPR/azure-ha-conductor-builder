@@ -26,9 +26,11 @@
   /* node1's own region, VNet, subnet and identity only apply while it has its own resource group. */
   const NODE1_OWN_RG = { field: 'node1ResourceGroup', set: true };
 
+  /* standaloneTitle: section title in a standalone (single-node) deployment. */
   const SECTIONS = [
-    { id: 'azure', title: 'Azure deployment (both nodes; node1 can override some below)' },
-    { id: 'nodes', title: 'Conductor nodes' },
+    { id: 'deployment', title: 'Deployment type' },
+    { id: 'azure', title: 'Azure deployment (both nodes; node1 can override some below)', standaloneTitle: 'Azure deployment' },
+    { id: 'nodes', title: 'Conductor nodes', standaloneTitle: 'Conductor node' },
     { id: 'node1rg', title: 'node1 in its own resource group (optional)' },
     { id: 'ssr', title: 'SSR software and conductor identity' },
     { id: 'creds', title: 'Account passwords (SHA-512 crypt hashes)' },
@@ -41,8 +43,18 @@
    * when: { field, equals } or { field, set: true } - the field only applies (and is only required) when another
    *   field has that value, or is not empty
    * fallback: (values) => value used when the field is left empty (shown as its placeholder in the form)
-   * select options: strings, or { value, label } */
+   * select options: strings, or { value, label }
+   * HA-only fields and the standalone wording of the other fields are defined in HA_ONLY and STANDALONE_TEXT below. */
   const FIELDS = [
+    {
+      id: 'deploymentMode', section: 'deployment', label: 'Deployment type', kind: 'select', def: 'ha',
+      options: [
+        { value: 'ha', label: 'High availability: two conductor nodes (node0 + node1)' },
+        { value: 'standalone', label: 'Standalone: a single conductor node' },
+      ],
+      help: 'High availability deploys two conductor VMs that form an HA pair; node1 joins node0 through a temporary HA peer login. Standalone deploys a single conductor VM with a much shorter MOP: no second node, no HA peer access, no HA sync. Inputs that only apply to HA are hidden and ignored in standalone mode.',
+      usedIn: [`${F.mop}: procedure and topology`, `${F.p1}, ${F.c1}: generated for HA only`, `${F.p0}: haPeerPrivateIp (HA only)`],
+    },
     {
       id: 'resourceGroup', section: 'azure', label: 'Resource group', kind: 'text', required: true,
       ph: '<input-your-resource-group>',
@@ -353,6 +365,92 @@
 
   const FIELD_BY_ID = Object.fromEntries(FIELDS.map((f) => [f.id, f]));
 
+  /* Inputs that only exist in an HA deployment: hidden, not validated and ignored when standalone is selected. */
+  const HA_ONLY = [
+    'node1Name', 'node1VmName', 'node1PrivateIp', 'node1Zone', 'node1PublicIpName',
+    'node1ResourceGroup', 'node1Location', 'node1VirtualNetworkName', 'node1VirtualNetworkResourceGroup',
+    'node1ControlSubnetName', 'node1ManagedIdentity', 'node1ManagedIdentityResourceGroup',
+    'haPeerPassword',
+  ];
+  for (const id of HA_ONLY) FIELD_BY_ID[id].haOnly = true;
+
+  /* Wording of the remaining fields for a standalone deployment ({ label, help, usedIn, options }; unset = HA text).
+   * "Used in" entries for node1's files are dropped automatically. */
+  const STANDALONE_TEXT = {
+    resourceGroup: {
+      help: 'Existing resource group the conductor VM, NIC, NSG (and optional public IP) are created in.',
+      usedIn: [`${F.mop}: --resource-group of the az commands`],
+    },
+    location: { help: 'Region of the VNet, lowercase with no spaces (e.g. eastus, westeurope).' },
+    virtualNetworkName: { help: 'Existing VNet the conductor is attached to.' },
+    virtualNetworkResourceGroup: { help: 'Only needed when the VNet lives in a different resource group. Empty = the conductor\'s resource group.' },
+    controlSubnetName: { help: 'Existing subnet for the conductor\'s control interface. Managed routers must reach it.' },
+    managedIdentity: { help: 'Identity attached to the conductor VM. Needs Microsoft.Compute/virtualMachines/read, Microsoft.Network/networkInterfaces/read and Microsoft.Network/virtualNetworks/read.' },
+    managedIdentityResourceGroup: { help: 'Only needed when the identity lives in a different resource group. Empty = the conductor\'s resource group.' },
+    instanceSize: { help: 'Size of the conductor VM.' },
+    availabilitySetName: { help: 'Optional existing availability set for the conductor VM, in regions without availability zones. Leave empty when using a zone.' },
+    publicIpMode: {
+      label: 'Public IP',
+      options: [
+        { value: 'none', label: 'None (private IP only)' },
+        { value: 'create', label: 'Create a new public IP' },
+        { value: 'existing', label: 'Attach an existing public IP' },
+      ],
+      help: 'Public IP on the conductor\'s control interface, needed when routers reach the conductor over the Internet. "Create" adds a static Standard SKU public IP named <VM name>-control; "Attach existing" uses a public IP you already own (for example, an address already allow-listed by routers).',
+    },
+    publicIpResourceGroup: { help: 'Only needed when the existing public IP lives in a different resource group than the conductor. Empty = the conductor\'s resource group.' },
+    adminPublicKeyData: { help: 'Public key (ssh-rsa, at least 2048-bit) used to log in as t128 on the conductor. The MOP runs every conductor step over SSH with the matching private key.' },
+    node0Name: {
+      label: 'SSR node name',
+      help: 'Name of the conductor node inside SSR: the PCLI prompt, the configuration and global.init. Letters, digits and hyphens; node0 is the usual name for a standalone conductor. The node\'s hostname and asset ID become <conductor name>-<node name>.',
+      usedIn: [`${F.c0}: initializer-overrides.node-name, name, pdc-key-comment`, `${F.mop}: PCLI node name and asset ID`],
+    },
+    node0VmName: { label: 'VM name', help: 'Azure VM name of the conductor (also prefixes its NIC/NSG/disk names).' },
+    node0PrivateIp: {
+      label: 'Private IP',
+      help: 'Free static IP in the control subnet for the conductor. It is the conductor address that managed routers connect to.',
+      usedIn: [`${F.p0}: controlPrivateIp`, `${F.c0}: initializer-overrides.node-ip`, `${F.mop}: SSH target, optional conductor-address`],
+    },
+    node0Zone: { label: 'Availability zone', help: 'Zone of the conductor VM. Empty when the region has no zones.' },
+    node0PublicIpName: {
+      label: 'Existing public IP name',
+      help: 'Existing public IP for the conductor: Standard SKU, static, same region, not attached to anything else, and zone-redundant or in the conductor\'s zone.',
+    },
+    conductorName: {
+      help: 'Name of the conductor router. The node gets the hostname <name>-<node name> (by default <name>-node0), which is also its asset ID (salt minion ID) in the PCLI.',
+      usedIn: [`${F.c0}: initializer-overrides.router-name, name, pdc-key-comment`, `${F.mop}: PCLI router name and asset ID`],
+    },
+    ssrVersion: { help: 'SSR software version installed on the conductor (6.3.0 or later).' },
+    t128PasswordHash: {
+      help: 'SHA-512 crypt hash for the Linux t128 account (SSH still uses the key).',
+      usedIn: [`${F.c0}: t128-password`],
+    },
+    timezone: { help: 'Optional IANA timezone for the conductor, e.g. America/New_York.' },
+  };
+
+  function isStandalone(values) {
+    return values.deploymentMode === 'standalone';
+  }
+
+  /* Label, help, "Used in" entries and select options of a field as shown for the selected deployment type. */
+  function fieldView(values, id) {
+    const f = FIELD_BY_ID[id];
+    const view = { label: f.label, help: f.help, usedIn: f.usedIn, options: f.options };
+    if (!isStandalone(values)) return view;
+    Object.assign(view, STANDALONE_TEXT[id] || {});
+    view.usedIn = view.usedIn.filter((u) => !u.startsWith(`${F.p1}:`) && !u.startsWith(`${F.c1}:`));
+    return view;
+  }
+
+  /* Title of a form section, and whether it is shown (it is hidden when none of its fields applies). */
+  function sectionView(values, id) {
+    const section = SECTIONS.find((sec) => sec.id === id);
+    return {
+      title: (isStandalone(values) && section.standaloneTitle) || section.title,
+      hidden: FIELDS.filter((f) => f.section === id).every((f) => !isActive(values, f.id)),
+    };
+  }
+
   function defaults() {
     const values = {};
     for (const f of FIELDS) values[f.id] = f.kind === 'checkbox' ? Boolean(f.def) : (f.def ?? '');
@@ -360,7 +458,9 @@
   }
 
   function isActive(values, id) {
-    const w = FIELD_BY_ID[id].when;
+    const f = FIELD_BY_ID[id];
+    if (f.haOnly && isStandalone(values)) return false;
+    const w = f.when;
     if (!w) return true;
     return w.set ? String(values[w.field] ?? '').trim() !== '' : values[w.field] === w.equals;
   }
@@ -515,14 +615,15 @@
   }
 
   function cloudInit(values, node) {
-    const role = node === 0
-      ? 'node0 - primary. Initialized standalone, node1 joins it later.'
-      : 'node1 - secondary. Learns the setup from node0 over SSH (learn-from-ha-peer).';
+    let role;
+    if (isStandalone(values)) role = 'Standalone SSR conductor - a single node, no HA peer.';
+    else if (node === 0) role = 'SSR HA conductor node0 - primary. Initialized standalone, node1 joins it later.';
+    else role = 'SSR HA conductor node1 - secondary. Learns the setup from node0 over SSH (learn-from-ha-peer).';
     const json = JSON.stringify(onboardingConfig(values, node), null, 2)
       .split('\n').map((line) => `      ${line}`).join('\n');
     return [
       '#cloud-config',
-      `# SSR HA conductor ${role}`,
+      `# ${role}`,
       `# SSR node name: ${ssrNodeName(values, node)} (initializer-overrides.node-name; the top-level node-name must stay node${node})`,
       '# Pass to the deployment with: --parameters customData=@<this file>',
       'write_files:',
@@ -555,7 +656,8 @@
         virtualNetworkResourceGroup: p(linkedResourceGroupParam(values, node, 'virtualNetwork')),
         controlSubnetName: p(nodeSetting(values, node, 'controlSubnetName')),
         controlPrivateIp: p(s(`${self}PrivateIp`)),
-        haPeerPrivateIp: p(s(`${peer}PrivateIp`)),
+        // A standalone conductor has no HA peer: the template then skips the HA peer NSG rule.
+        ...(isStandalone(values) ? {} : { haPeerPrivateIp: p(s(`${peer}PrivateIp`)) }),
         createPublicIp: p(publicIp(values, node).mode === 'create'),
         existingPublicIpName: p(publicIp(values, node).mode === 'existing' ? publicIp(values, node).name : ''),
         existingPublicIpResourceGroup: p(s('publicIpResourceGroup')),
@@ -569,12 +671,11 @@
 
   /* Files whose content depends on the inputs. */
   function buildGeneratedFiles(values) {
+    const nodes = isStandalone(values) ? [0] : [0, 1];
     return [
       { path: F.mop, content: mopDocument(values) },
-      { path: F.p0, content: paramsFile(values, 0) },
-      { path: F.p1, content: paramsFile(values, 1) },
-      { path: F.c0, content: cloudInit(values, 0) },
-      { path: F.c1, content: cloudInit(values, 1) },
+      ...nodes.map((n) => ({ path: F[`p${n}`], content: paramsFile(values, n) })),
+      ...nodes.map((n) => ({ path: F[`c${n}`], content: cloudInit(values, n) })),
     ];
   }
 
@@ -613,6 +714,17 @@
     node1: { label: 'node1 root shell', lang: 'bash' },
     pcli0: { label: 'node0 PCLI (admin)', lang: 'pcli' },
   };
+
+  /* In a standalone deployment node0 is the only node, so the MOP calls it the conductor. */
+  const WHERE_STANDALONE = {
+    node0: { label: 'conductor root shell', lang: 'bash' },
+    pcli0: { label: 'conductor PCLI (admin)', lang: 'pcli' },
+  };
+
+  /* Label and code block language of a MOP step's "where" for the selected deployment type. */
+  function whereFor(values, key) {
+    return (isStandalone(values) && WHERE_STANDALONE[key]) || WHERE[key];
+  }
 
   /* Prints the initialization phase once a minute until READY or FAILED, then the conductors in global.init. */
   const STATUS_BLOCK = [
@@ -690,18 +802,27 @@
       ['--parameters', `@conductor-node${n}-params.json`, `customData=@conductor-node${n}-cloud-init.txt`],
       ['--query', '[properties.provisioningState, properties.outputs.SSHLogin.value]'], ['--output', 'tsv'],
     ]);
+    const standalone = isStandalone(values);
     const steps = [];
     const step = (where, title, text, cmd, expect, optional = false) => steps.push({ where, title, text, cmd, expect, optional });
     /* Cross-reference to another step, resolved to its number once all steps exist. */
     const ref = (title) => `{{step:${title}}}`;
-    const connect = (n, deployTitle) => step('terminal', `Connect to node${n}`,
-      `Open an SSH session to ${vm[n]} and become root. Keep this session for every "node${n} root shell" step. SSH usually answers 2-5 minutes after step ${ref(deployTitle)}; if it refuses or times out, wait a minute and retry. `
+    /* How the MOP refers to a node and its root shell: "the conductor" in a standalone deployment. */
+    const nodeRef = (n) => (standalone ? 'the conductor' : `node${n}`);
+    const nodePossessive = (n) => (standalone ? "the conductor's" : `node${n}'s`);
+    const shell = (n) => whereFor(values, `node${n}`).label;
+    const titles = { deploy0: standalone ? 'Deploy the conductor' : 'Deploy node0' };
+    titles.connect0 = standalone ? 'Connect to the conductor' : 'Connect to node0';
+    titles.wait0 = standalone ? 'Wait until the conductor is initialized' : 'Wait until node0 is initialized';
+    titles.accept0 = standalone ? 'Accept the conductor\'s asset' : 'Accept node0\'s asset';
+    const connect = (n, deployTitle) => step('terminal', n === 0 ? titles.connect0 : `Connect to node${n}`,
+      `Open an SSH session to ${vm[n]} and become root. Keep this session for every "${shell(n)}" step. SSH usually answers 2-5 minutes after step ${ref(deployTitle)}; if it refuses or times out, wait a minute and retry. `
         + (hasPublicIp
           ? `Use the public IP printed by step ${ref(deployTitle)}, or the private IP ${ip[n]} if your terminal can reach it.`
           : `Your terminal must reach the private IP ${ip[n]} (VNet peering, VPN, ExpressRoute or a jump host in the VNet).`)
-        + ' If the private key that matches the SSH public key in the parameters files is not your SSH client\'s default key or loaded in ssh-agent, add `-i <private key file>`.'
+        + ` If the private key that matches the SSH public key in the parameters file${standalone ? '' : 's'} is not your SSH client's default key or loaded in ssh-agent, add \`-i <private key file>\`.`
         + (n === 0 ? '' : ' Keep the node0 session open too.'),
-      [`ssh t128@${hasPublicIp ? `<node${n}-public-ip>` : ip[n]}`, 'sudo -i'].join('\n'),
+      [`ssh t128@${hasPublicIp ? `<${standalone ? 'conductor' : `node${n}`}-public-ip>` : ip[n]}`, 'sudo -i'].join('\n'),
       `A root prompt on ${vm[n]}. The hostname is still \`${vm[n]}\` until the conductor is initialized.`);
 
     step('cloudshell', 'Confirm the Azure subscription',
@@ -715,80 +836,107 @@
         ['--query', 'accepted'], ['--output', 'tsv']]),
       '`true`');
     /* What happens after a deploy command returns, and how to watch it. */
-    const afterDeploy = (n) => `The deployment takes up to about 2 minutes. The node then installs and initializes SSR on its own and reboots twice, which typically takes 5-15 minutes (longer if the software download is slow). To watch the reboot cycle, attach to the VM's serial console: in the Azure portal open ${vm[n]} and select Help > Serial console, or run \`az serial-console connect --resource-group '${nodeResourceGroup(values, n)}' --name '${vm[n]}'\` in Cloud Shell (boot diagnostics, which the serial console needs, is enabled by the template).`;
-    step('cloudshell', 'Deploy node0',
+    const afterDeploy = (n) => `The deployment takes up to about 2 minutes. The ${standalone ? 'conductor' : 'node'} then installs and initializes SSR on its own and reboots twice, which typically takes 5-15 minutes (longer if the software download is slow). To watch the reboot cycle, attach to the VM's serial console: in the Azure portal open ${vm[n]} and select Help > Serial console, or run \`az serial-console connect --resource-group '${nodeResourceGroup(values, n)}' --name '${vm[n]}'\` in Cloud Shell (boot diagnostics, which the serial console needs, is enabled by the template).`;
+    step('cloudshell', titles.deploy0,
       `Creates ${vm[0]} from the template. The cloud-init file is passed as the template's \`customData\` parameter. ${afterDeploy(0)}`,
       deploy(0),
-      '`Succeeded` and the SSH command for node0, after up to about 2 minutes.');
-    connect(0, 'Deploy node0');
-    step('node0', 'Wait until node0 is initialized',
+      `\`Succeeded\` and the SSH command for ${nodeRef(0)}, after up to about 2 minutes.`);
+    connect(0, titles.deploy0);
+    step('node0', titles.wait0,
       'Paste once and leave it running: it prints the phase every minute (see "Timing and what to expect"). The VM reboots by itself at least twice, which closes your SSH session. That is expected: wait 2-3 minutes, reconnect with step '
-        + `${ref('Connect to node0')}, and paste this command again. Do not restart or redeploy the VM, and do not use \`az vm run-command\`, while it is INSTALLING, STARTING or INITIALIZING.`,
+        + `${ref(titles.connect0)}, and paste this command again. Do not restart or redeploy the VM, and do not use \`az vm run-command\`, while it is INSTALLING, STARTING or INITIALIZING.`,
       STATUS_BLOCK,
-      `\`READY\`, then \`conductors in global.init: ${name[0]}=${ip[0]}\` and the pending assets: \`${asset[0]}\` (node0's own asset, accepted in the next step; it can take a few minutes after \`READY\` to appear). \`FAILED\` means the bootstrapper stopped with an error (see Troubleshooting).`);
-    const pcliIntro = `In the node0 root shell, enter these commands one at a time, pressing Enter after each one. \`su admin\` opens the PCLI (the prompt becomes \`admin@${name[0]}.${router}#\`; if it shows a different router name, use that name in the commands), and \`quit\` returns to the root shell.`;
+      `\`READY\`, then \`conductors in global.init: ${name[0]}=${ip[0]}\` and the pending assets: \`${asset[0]}\` (${nodePossessive(0)} own asset, accepted in the next step; it can take a few minutes after \`READY\` to appear). \`FAILED\` means the bootstrapper stopped with an error (see Troubleshooting).`);
+    const pcliIntro = `In the ${shell(0)}, enter these commands one at a time, pressing Enter after each one. \`su admin\` opens the PCLI (the prompt becomes \`admin@${name[0]}.${router}#\`; if it shows a different router name, use that name in the commands), and \`quit\` returns to the root shell.`;
     /* A PCLI step's commands: opened with su admin from the root shell, closed with quit. */
     const pcli = (...lines) => ['su admin', ...lines, 'quit'].join('\n');
-    step('pcli0', 'Accept node0\'s asset',
-      `${pcliIntro} Setting node0's asset ID in the configuration accepts node0's pending asset: its salt minion key is accepted automatically as soon as the asset ID is configured. The status command in step ${ref('Wait until node0 is initialized')} listed the pending asset; if its ID differs from \`${asset[0]}\`, use that ID. \`commit force\` skips the confirmation prompt; validation still runs.`,
+    step('pcli0', titles.accept0,
+      `${pcliIntro} Setting ${nodePossessive(0)} asset ID in the configuration accepts ${nodePossessive(0)} pending asset: its salt minion key is accepted automatically as soon as the asset ID is configured. The status command in step ${ref(titles.wait0)} listed the pending asset; if its ID differs from \`${asset[0]}\`, use that ID. \`commit force\` skips the confirmation prompt; validation still runs.`,
       pcli(`config authority router ${router} node ${name[0]} asset-id ${asset[0]}`, 'commit force', 'show assets'),
-      `\`Configuration committed\`. In \`show assets\`, node0 with asset ID \`${asset[0]}\` moves through \`Synchronizing\` to \`Running\` within a few minutes; run \`show assets\` again before \`quit\` to follow it.`);
-    step('pcli0', 'Add node1 to the conductor configuration',
-      `${pcliIntro} Adds node1 (SSR node \`${name[1]}\`) as the second conductor node of the conductor router, so that node1 finds its own node in the configuration it receives from node0 when it joins. node1 is reported as not connected until then, which is expected.`,
-      pcli(`config authority router ${router} node ${name[1]} role conductor`, 'commit force'),
-      '`Configuration committed`, then the node0 root shell prompt.');
-    step('node0', 'Open temporary HA peer access on node0',
-      `Lets node1 (${ip[1]}) log in to node0 as t128 with the temporary HA peer password, which node1's initializer needs to copy the conductor setup from node0. It sets the temporary password, makes sudo ask t128 for it, allows SSH password login for t128 only from node1, and then tests both. This automates "Configure Node A" in the Conductor HA for Cloud Deployments documentation. Paste the whole block. Keep this root shell open: from now on \`sudo -i\` on node0 asks for the temporary password. Step ${ref('Close HA peer access on node0')} reverts it.`,
-      openPeerBlock(s('haPeerPassword'), ip[1]),
-      '`HA_PEER_ACCESS_OPEN`. If it prints `ERROR: ...` instead, fix that first (see Troubleshooting); do not deploy node1 yet.');
-    step('cloudshell', 'Deploy node1',
-      `Creates ${vm[1]}. Only run this after step ${ref('Open temporary HA peer access on node0')} printed \`HA_PEER_ACCESS_OPEN\`: node1's initializer logs in to node0 once, and a failed login stops it. ${afterDeploy(1)}`,
-      deploy(1),
-      '`Succeeded` and the SSH command for node1, after up to about 2 minutes.');
-    connect(1, 'Deploy node1');
-    step('node1', 'Wait until node1 has joined',
-      `The same status command as step ${ref('Wait until node0 is initialized')}, with the same reboots and reconnects. node1 also logs in to node0 to copy the conductor setup.`,
-      STATUS_BLOCK,
-      `\`READY\`, then \`conductors in global.init: ${name[0]}=${ip[0]}, ${name[1]}=${ip[1]}\`.`);
-    step('node0', 'Close HA peer access on node0',
-      `Removes the SSH password exception and the sudo rule, and resets t128 to the password from the onboarding configuration. The temporary password stops working. Paste the whole block. If your node0 session was closed since step ${ref('Open temporary HA peer access on node0')} (for example while node1 was joining), reconnect with step ${ref('Connect to node0')}: \`sudo -i\` now asks for t128's password, which at this point is the temporary HA peer password (the \`unsafe-ha-peer-password\` in node1's cloud-init file).`,
-      closePeerBlock(s('t128PasswordHash'), ip[1]),
-      '`HA_PEER_ACCESS_CLOSED`');
-    step('node0', 'Restart node0',
-      'node0 must restart to recognize node1. Your SSH session closes.',
-      'systemctl reboot',
-      'The session closes.');
-    step('node0', 'Wait until node0 is back',
-      `Wait 2-3 minutes, reconnect to node0 with step ${ref('Connect to node0')}, and run the status command.`,
-      STATUS_BLOCK,
-      `\`READY\`, \`conductors in global.init: ${name[0]}=${ip[0]}, ${name[1]}=${ip[1]}\`, and \`${asset[1]}\` among the pending assets (it can take a few minutes to appear; it is accepted in the next step either way).`);
-    step('pcli0', 'Accept node1\'s asset',
-      `${pcliIntro} Setting node1's asset ID accepts node1's pending asset. If the pending asset listed in step ${ref('Wait until node0 is back')} has a different ID than \`${asset[1]}\`, use that ID.`,
-      pcli(`config authority router ${router} node ${name[1]} asset-id ${asset[1]}`, 'commit force', 'show assets'),
-      `\`Configuration committed\`. In \`show assets\`, node1 with asset ID \`${asset[1]}\` moves through \`Synchronizing\` to \`Running\` within a few minutes.`);
-    step('pcli0', 'Verify the HA pair',
-      `${pcliIntro} Wait until both assets are \`Running\` (repeat \`show assets\`), then check that the conductor nodes see each other.`,
-      pcli('show system connectivity', 'show assets'),
-      `\`show system connectivity\` lists ${name[0]} and ${name[1]} as connected, and \`show assets\` shows \`${asset[0]}\` and \`${asset[1]}\` as \`Running\`.`);
+      `\`Configuration committed\`. In \`show assets\`, ${nodeRef(0)} with asset ID \`${asset[0]}\` moves through \`Synchronizing\` to \`Running\` within a few minutes; run \`show assets\` again before \`quit\` to follow it.`);
+    if (standalone) {
+      step('pcli0', 'Verify the conductor',
+        `${pcliIntro} Wait until the conductor's asset is \`Running\` (repeat \`show assets\`), then check the conductor's system state.`,
+        pcli('show assets', 'show system'),
+        `\`show assets\` shows \`${asset[0]}\` as \`Running\`, and \`show system\` lists node \`${name[0]}\` as running, with role conductor and software version ${s('ssrVersion')}.`);
+    } else {
+      step('pcli0', 'Add node1 to the conductor configuration',
+        `${pcliIntro} Adds node1 (SSR node \`${name[1]}\`) as the second conductor node of the conductor router, so that node1 finds its own node in the configuration it receives from node0 when it joins. node1 is reported as not connected until then, which is expected.`,
+        pcli(`config authority router ${router} node ${name[1]} role conductor`, 'commit force'),
+        '`Configuration committed`, then the node0 root shell prompt.');
+      step('node0', 'Open temporary HA peer access on node0',
+        `Lets node1 (${ip[1]}) log in to node0 as t128 with the temporary HA peer password, which node1's initializer needs to copy the conductor setup from node0. It sets the temporary password, makes sudo ask t128 for it, allows SSH password login for t128 only from node1, and then tests both. This automates "Configure Node A" in the Conductor HA for Cloud Deployments documentation. Paste the whole block. Keep this root shell open: from now on \`sudo -i\` on node0 asks for the temporary password. Step ${ref('Close HA peer access on node0')} reverts it.`,
+        openPeerBlock(s('haPeerPassword'), ip[1]),
+        '`HA_PEER_ACCESS_OPEN`. If it prints `ERROR: ...` instead, fix that first (see Troubleshooting); do not deploy node1 yet.');
+      step('cloudshell', 'Deploy node1',
+        `Creates ${vm[1]}. Only run this after step ${ref('Open temporary HA peer access on node0')} printed \`HA_PEER_ACCESS_OPEN\`: node1's initializer logs in to node0 once, and a failed login stops it. ${afterDeploy(1)}`,
+        deploy(1),
+        '`Succeeded` and the SSH command for node1, after up to about 2 minutes.');
+      connect(1, 'Deploy node1');
+      step('node1', 'Wait until node1 has joined',
+        `The same status command as step ${ref('Wait until node0 is initialized')}, with the same reboots and reconnects. node1 also logs in to node0 to copy the conductor setup.`,
+        STATUS_BLOCK,
+        `\`READY\`, then \`conductors in global.init: ${name[0]}=${ip[0]}, ${name[1]}=${ip[1]}\`.`);
+      step('node0', 'Close HA peer access on node0',
+        `Removes the SSH password exception and the sudo rule, and resets t128 to the password from the onboarding configuration. The temporary password stops working. Paste the whole block. If your node0 session was closed since step ${ref('Open temporary HA peer access on node0')} (for example while node1 was joining), reconnect with step ${ref('Connect to node0')}: \`sudo -i\` now asks for t128's password, which at this point is the temporary HA peer password (the \`unsafe-ha-peer-password\` in node1's cloud-init file).`,
+        closePeerBlock(s('t128PasswordHash'), ip[1]),
+        '`HA_PEER_ACCESS_CLOSED`');
+      step('node0', 'Restart node0',
+        'node0 must restart to recognize node1. Your SSH session closes.',
+        'systemctl reboot',
+        'The session closes.');
+      step('node0', 'Wait until node0 is back',
+        `Wait 2-3 minutes, reconnect to node0 with step ${ref('Connect to node0')}, and run the status command.`,
+        STATUS_BLOCK,
+        `\`READY\`, \`conductors in global.init: ${name[0]}=${ip[0]}, ${name[1]}=${ip[1]}\`, and \`${asset[1]}\` among the pending assets (it can take a few minutes to appear; it is accepted in the next step either way).`);
+      step('pcli0', 'Accept node1\'s asset',
+        `${pcliIntro} Setting node1's asset ID accepts node1's pending asset. If the pending asset listed in step ${ref('Wait until node0 is back')} has a different ID than \`${asset[1]}\`, use that ID.`,
+        pcli(`config authority router ${router} node ${name[1]} asset-id ${asset[1]}`, 'commit force', 'show assets'),
+        `\`Configuration committed\`. In \`show assets\`, node1 with asset ID \`${asset[1]}\` moves through \`Synchronizing\` to \`Running\` within a few minutes.`);
+      step('pcli0', 'Verify the HA pair',
+        `${pcliIntro} Wait until both assets are \`Running\` (repeat \`show assets\`), then check that the conductor nodes see each other.`,
+        pcli('show system connectivity', 'show assets'),
+        `\`show system connectivity\` lists ${name[0]} and ${name[1]} as connected, and \`show assets\` shows \`${asset[0]}\` and \`${asset[1]}\` as \`Running\`.`);
+    }
 
     // Optional: conductor addresses for managed routers. Public IPs are only known after deployment.
+    const nodes = standalone ? [0] : [0, 1];
     if (hasPublicIp) {
       const ips = (n) => az(['vm', 'list-ip-addresses'], [rgOf(n), ['--name', vm[n]],
         ['--query', '[0].virtualMachine.network.[privateIpAddresses[0], publicIpAddresses[0].ipAddress]'], ['--output', 'tsv']]);
-      step('cloudshell', 'Look up the conductor addresses',
-        'Prints the private and the public IP of each node (node0 first). Note the address the managed routers will use to reach each node: the public IP when routers connect over the Internet, the private IP when they reach the VNet privately (VNet peering, VPN or ExpressRoute).',
-        [ips(0), ips(1)].join('\n'),
-        `One line per node: the private IP (\`${ip[0]}\`, then \`${ip[1]}\`) and the public IP.`, true);
+      if (standalone) {
+        step('cloudshell', 'Look up the conductor address',
+          'Prints the private and the public IP of the conductor. Note the address the managed routers will use to reach it: the public IP when routers connect over the Internet, the private IP when they reach the VNet privately (VNet peering, VPN or ExpressRoute).',
+          ips(0),
+          `One line: the private IP (\`${ip[0]}\`) and the public IP.`, true);
+      } else {
+        step('cloudshell', 'Look up the conductor addresses',
+          'Prints the private and the public IP of each node (node0 first). Note the address the managed routers will use to reach each node: the public IP when routers connect over the Internet, the private IP when they reach the VNet privately (VNet peering, VPN or ExpressRoute).',
+          nodes.map(ips).join('\n'),
+          `One line per node: the private IP (\`${ip[0]}\`, then \`${ip[1]}\`) and the public IP.`, true);
+      }
     }
-    const addr = hasPublicIp ? ['<node0-address>', '<node1-address>'] : ip;
-    step('pcli0', 'Set the conductor addresses for managed routers',
-      `${pcliIntro} Adds both conductor nodes to \`authority conductor-address\`. Managed routers receive this list in their configuration and connect to both conductor nodes, so a router keeps its conductor connection when one node is down. `
-        + (hasPublicIp
-          ? `Replace \`<node0-address>\` and \`<node1-address>\` with the addresses chosen in step ${ref('Look up the conductor addresses')}. `
-          : `The commands use the private IPs, which routers reach through VNet peering, VPN or ExpressRoute; use other addresses (for example a NAT or DNS name) if that is how routers reach the nodes. `)
-        + 'Do this before onboarding routers; it can also be done later. It changes the configuration of every managed router, and a conductor address can be an IP address or a DNS name.',
-      pcli(`config authority conductor-address ${addr[0]}`, `config authority conductor-address ${addr[1]}`, 'commit force'),
-      '`Configuration committed`, then the node0 root shell prompt.', true);
+    if (standalone) {
+      const addr = hasPublicIp ? '<conductor-address>' : ip[0];
+      step('pcli0', 'Set the conductor address for managed routers',
+        `${pcliIntro} Sets \`authority conductor-address\`, the address managed routers receive in their configuration and use to reach the conductor. `
+          + (hasPublicIp
+            ? `Replace \`<conductor-address>\` with the address chosen in step ${ref('Look up the conductor address')}. `
+            : 'The command uses the private IP, which routers reach through VNet peering, VPN or ExpressRoute; use another address (for example a NAT or DNS name) if that is how routers reach the conductor. ')
+          + 'Do this before onboarding routers; it can also be done later. It changes the configuration of every managed router, and a conductor address can be an IP address or a DNS name.',
+        pcli(`config authority conductor-address ${addr}`, 'commit force'),
+        '`Configuration committed`, then the conductor root shell prompt.', true);
+    } else {
+      const addr = hasPublicIp ? ['<node0-address>', '<node1-address>'] : ip;
+      step('pcli0', 'Set the conductor addresses for managed routers',
+        `${pcliIntro} Adds both conductor nodes to \`authority conductor-address\`. Managed routers receive this list in their configuration and connect to both conductor nodes, so a router keeps its conductor connection when one node is down. `
+          + (hasPublicIp
+            ? `Replace \`<node0-address>\` and \`<node1-address>\` with the addresses chosen in step ${ref('Look up the conductor addresses')}. `
+            : 'The commands use the private IPs, which routers reach through VNet peering, VPN or ExpressRoute; use other addresses (for example a NAT or DNS name) if that is how routers reach the nodes. ')
+          + 'Do this before onboarding routers; it can also be done later. It changes the configuration of every managed router, and a conductor address can be an IP address or a DNS name.',
+        pcli(`config authority conductor-address ${addr[0]}`, `config authority conductor-address ${addr[1]}`, 'commit force'),
+        '`Configuration committed`, then the node0 root shell prompt.', true);
+    }
     const numbers = Object.fromEntries(steps.map((st, i) => [st.title, i + 1]));
     const resolveRefs = (text) => text.replace(/\{\{step:([^}]+)\}\}/g, (_, title) => {
       if (!numbers[title]) throw new Error(`unknown MOP step: ${title}`);
@@ -833,8 +981,40 @@
     ];
   }
 
+  /* Single-node version of the diagram: one VM, no HA sync link and no HA peer NSG rule. */
+  function standaloneTopologyDiagram(values) {
+    const s = (id) => resolve(values, id);
+    const mode = publicIp(values, 0).mode;
+    const vm = s('node0VmName');
+    const ip = s('node0PrivateIp');
+    const pip = mode === 'none' ? ['no public IP'] : [`public IP (${mode === 'create' ? 'new' : 'existing'})`, `  ${publicIp(values, 0).name}`];
+    const title = `Azure VM ${vm}`;
+    const ssr = [placement(values, 0) || 'no zone or availability set', `SSR router ${s('conductorName')}, node ${ssrNodeName(values, 0)}`, `hostname ${nodeHostname(values, 0)}`, '', `ge-0-0  ${ip}`, '  conductor address'];
+    const nic = [`NIC ${vm}-control`, `  static IP ${ip}`, '  tag SSR-ROLE=MGMT', `NSG ${vm}-control`, ...pip];
+    const LINK = 4;
+    const linkLabel = ' NIC appears in the VM as ge-0-0';
+    const width = Math.max(title.length + 6, ...[...ssr, ...nic].map((l) => l.length + 4), LINK + 1 + linkLabel.length);
+    const bus = '═'.repeat(width).split('');
+    bus[LINK] = '╧';
+    const vnetRg = s('virtualNetworkResourceGroup');
+    return [
+      `Resource group ${s('resourceGroup')} (${s('location')}) - created: VM, NIC, NSG${mode === 'create' ? ', public IP' : ''}`,
+      '',
+      ...diagramBox(title, ssr, width, { down: LINK }),
+      `${' '.repeat(LINK)}│${linkLabel}`,
+      ...diagramBox('', nic, width, { up: LINK, down: LINK }),
+      bus.join(''),
+      ` Subnet ${s('controlSubnetName')} in VNet ${s('virtualNetworkName')} (existing${vnetRg ? `, resource group ${vnetRg}` : ''})`,
+      ` Inbound, allowed by the NSG${mode === 'none' ? '' : ' (private and public IP)'}:`,
+      `   ${'routers'.padEnd(9)}${'TCP 930, 933, 4505-4506'.padEnd(25)}from ${s('controlAllowedCidr')}`,
+      `   ${'admins'.padEnd(9)}${'TCP 22, 443'.padEnd(25)}from ${s('adminAllowedCidr')}`,
+      ' Outbound: HTTPS to the SSR software repository (install and upgrades)',
+    ].join('\n');
+  }
+
   /* Monospace (box-drawing) diagram of both nodes: Azure VM + NIC + NSG outside, SSR node and ge-0-0 inside. */
   function topologyDiagram(values) {
+    if (isStandalone(values)) return standaloneTopologyDiagram(values);
     const s = (id) => resolve(values, id);
     const mode = publicIp(values, 0).mode;
     const router = s('conductorName');
@@ -910,8 +1090,43 @@
     ].join('\n');
   }
 
+  /* Single-node version of topologyMarkdown. */
+  function standaloneTopologyMarkdown(values) {
+    const s = (id) => resolve(values, id);
+    const FENCE = '```';
+    const c = (x) => `\`${x}\``;
+    const vm = s('node0VmName');
+    const nic = c(`${vm}-control`);
+    const where = placement(values, 0);
+    const pip = publicIp(values, 0);
+    const pipRg = s('publicIpResourceGroup');
+    const vnetRg = s('virtualNetworkResourceGroup');
+    const publicIpRow = {
+      none: ['No public IP', 'Routers and administrators reach the conductor on its private IP (VNet peering, VPN or ExpressRoute).'],
+      create: [`New public IP ${c(pip.name)}`, 'Created by the template: Standard SKU, static, in the VM\'s zone. Use it when routers or administrators reach the conductor over the Internet; the NSG rules apply to it too.'],
+      existing: [`Existing public IP ${c(pip.name)}${pipRg ? ` (resource group ${c(pipRg)})` : ''}`, 'Already created; the template only attaches it to the NIC, and the MOP rollback does not delete it. Use it when routers or administrators reach the conductor over the Internet; the NSG rules apply to it too.'],
+    }[pip.mode];
+    return [
+      'The standalone SSR conductor is one Azure VM with a **single NIC** in an existing subnet. Inside the VM, SSR sees that NIC as `ge-0-0`, and it carries the conductor (control) traffic from managed routers. There is no second node, so there is no HA sync or fabric interface.',
+      '',
+      `${FENCE}text`,
+      standaloneTopologyDiagram(values),
+      FENCE,
+      '',
+      '| SSR term (inside the VM) | Azure resource (outside the VM) | Details |',
+      '|---|---|---|',
+      `| Conductor router ${c(s('conductorName'))}, node ${c(ssrNodeName(values, 0))} | VM ${c(vm)}${where ? ` (${where})` : ''} | One VM from the BYOL marketplace image, deployed from the ARM template. Hostname (also the asset ID) ${c(nodeHostname(values, 0))}. |`,
+      `| Interface ${c('ge-0-0')} | NIC ${nic} | The only NIC on the VM, so SSR names it ${c('ge-0-0')}. Tagged ${c('SSR-ROLE=MGMT')}; accelerated networking and IP forwarding enabled. |`,
+      `| Node IP (${c('node-ip')}), the conductor address | Static private IP ${c(s('node0PrivateIp'))} | The NIC IP (template ${c('controlPrivateIp')}) and the cloud-init ${c('node-ip')} are the same value. Managed routers connect to this address (or to the public IP). |`,
+      `| - | NSG ${nic} | Inbound allow: TCP 22, 443 from ${c(s('adminAllowedCidr'))}; TCP 930 (router control), 933 (secure onboarding), 4505-4506 (salt) from ${c(s('controlAllowedCidr'))}. |`,
+      `| - | ${publicIpRow[0]} | ${publicIpRow[1]} |`,
+      `| - | VNet ${c(s('virtualNetworkName'))}, subnet ${c(s('controlSubnetName'))}${vnetRg ? ` (resource group ${c(vnetRg)})` : ''} | Existing, not created by the template. Needs outbound HTTPS for the SSR download. |`,
+    ].join('\n');
+  }
+
   /* Diagram plus a table mapping each SSR (inside the VM) term to its Azure (outside the VM) resource. */
   function topologyMarkdown(values) {
+    if (isStandalone(values)) return standaloneTopologyMarkdown(values);
     const s = (id) => resolve(values, id);
     const FENCE = '```';
     const c = (x) => `\`${x}\``;
@@ -962,7 +1177,177 @@
     ].join('\n');
   }
 
+  /* ---------- MOP sections shared by the HA and the standalone document ---------- */
+  const CODE_FENCE = '```';
+
+  /* Phase table and the "while it initializes" rules. noun: 'node' (HA) or 'conductor' (standalone). */
+  function phaseSection(noun, initializing) {
+    const subject = noun === 'node' ? 'a node' : `the ${noun}`;
+    return [
+      'The status command prints one line per minute with the time, the uptime (it drops back to a few minutes after each reboot) and the phase:',
+      '',
+      `| Phase | What the ${noun} is doing | Typical duration |`,
+      '|---|---|---|',
+      '| `INSTALLING` | Downloading and installing the SSR software. Ends with the first reboot. | Most of the 5-15 minutes; longer on a slow download |',
+      '| `STARTING` | Booting, or waiting for the bootstrapper or SSR to start. | 1-3 minutes after each reboot |',
+      `| \`INITIALIZING\` | ${initializing} Ends with the second reboot. | A few minutes |`,
+      '| `READY` | Done. The status command stops and lists the conductors. | - |',
+      '| `FAILED` | The bootstrapper stopped with an error. See Troubleshooting. | - |',
+      '',
+      `While ${subject} is \`INSTALLING\`, \`STARTING\` or \`INITIALIZING\`:`,
+      '',
+      '- **Let it work.** When your session closes, wait 2-3 minutes, reconnect, run `sudo -i`, and paste the status command again.',
+      '- **Do not** restart, stop or redeploy the VM.',
+      '- **Do not** use `az vm run-command`. Azure runs only one run-command per VM at a time, and a command sent while the VM is rebooting can stay pending for a long time and block every command after it.',
+      `- Only act when the status shows \`FAILED\`, or when the ${noun} has not reached \`READY\` after 60 minutes.`,
+    ];
+  }
+
+  /* The numbered procedure steps; optionalIntro(lastRequiredStep) introduces the optional steps at the end. */
+  function stepSections(values, optionalHeading, optionalIntro) {
+    const out = [];
+    const procedure = mopSteps(values);
+    const lastRequired = procedure.filter((st) => !st.optional).length;
+    procedure.forEach((step, i) => {
+      const where = whereFor(values, step.where);
+      if (step.optional && !procedure[i - 1].optional) out.push('', optionalHeading, '', optionalIntro(lastRequired));
+      out.push('', `### Step ${i + 1}${step.optional ? ' (optional)' : ''}: ${step.title}`, '', `**Run in:** ${where.label}`, '', step.text, '', `${CODE_FENCE}${where.lang}`, step.cmd, CODE_FENCE, '', `Expected: ${step.expect}`);
+    });
+    return out;
+  }
+
+  function troubleshootingCommands(setupComment) {
+    return [
+      `${CODE_FENCE}bash`,
+      '# Which bootstrapper task failed',
+      'cat /var/log/128T-hardware-bootstrapper/128T-hardware-bootstrapper.txt',
+      '# Download, install and onboarding errors',
+      'grep -nE "ERROR|Exiting with|stderr" /var/log/128T-hardware-bootstrapper/128T-hardware-bootstrapper.log | tail -n 30',
+      `# ${setupComment}`,
+      'grep -iE "error|fail|invalid" /var/log/128technology/initializer.log | tail -n 30',
+      '# SSR download progress',
+      'journalctl -u ember --no-pager | tail -n 40',
+      '# Onboarding configuration not written by cloud-init',
+      'tail -n 30 /var/log/cloud-init-output.log',
+      CODE_FENCE,
+    ];
+  }
+
+  const TROUBLE_INSTALLING = '- **`INSTALLING` for more than 60 minutes:** check the SSR download progress. Usual causes are a wrong repository user or token, or no outbound HTTPS from the subnet.';
+  const TROUBLE_FAILED = '- **`FAILED`:** the task table shows which task failed. When the initializer fails, the bootstrapper log reports it as `Error enabling release repo`; the real cause is in the `stderr` part of that line and in the initializer log. On failure, a tech-support bundle is saved at `/var/log/128T-hardware-bootstrapper/hardware-bootstrapper-tech-support.zip`.';
+
+  /* hostnames: the asset IDs as text; shellName: where t128-salt-key is run. */
+  function troubleAsset(hostnames, shellName) {
+    return `- **An asset stays \`Pending\`, or \`show assets\` shows a configured asset that never connects:** the asset ID in the configuration must equal the node's salt minion ID, which is its hostname (${hostnames}). In the ${shellName}, \`t128-salt-key -L\` lists the IDs that are waiting (\`Unaccepted Keys\`) and accepted. Set the asset ID in the PCLI to the listed ID and commit again. A pending key that is not accepted within 10 minutes is dropped and sent again by the node, so it can briefly disappear from the list.`;
+  }
+
+  function troubleSsh(noun) {
+    return [
+      `- **SSH refused or timing out:** the ${noun} is booting or rebooting; wait 2-3 minutes. If it persists, check that your terminal's address is inside the admin allowed range and that nothing else (a subnet NSG, a firewall) blocks TCP 22.`,
+      `- **No SSH access at all:** as a last resort, read a log from Cloud Shell with \`az vm run-command invoke --resource-group '<resource group>' --name '<vm>' --command-id RunShellScript --scripts 'tail -n 50 <log file>' --query 'value[0].message' --output tsv\`. Send one command at a time, wait for it to return, and never send one while the ${noun} is rebooting.`,
+    ];
+  }
+
+  /* MOP for a standalone (single-node) conductor: deploy, initialize and accept its asset; no HA steps. */
+  function standaloneMopDocument(values) {
+    const s = (id) => resolve(values, id);
+    const code = (x) => `\`${x}\``;
+    const customer = s('mopCustomer');
+    const pip = publicIp(values, 0);
+    const zone = s('node0Zone') || (s('availabilitySetName') ? `availability set ${s('availabilitySetName')}` : 'none');
+    const pipWhere = `in resource group ${code(s('publicIpResourceGroup') || s('resourceGroup'))}`;
+    const publicIpText = { none: 'no', create: `new (${code(pip.name)})`, existing: `existing ${code(pip.name)} ${pipWhere}` }[pip.mode];
+    const shell = whereFor(values, 'node0').label;
+    const pcliLabel = whereFor(values, 'pcli0').label;
+    return [
+      `# MOP: Standalone SSR conductor in Azure${customer ? ` - ${customer}` : ''}`,
+      '',
+      'This procedure deploys a single-node (standalone) Session Smart conductor in Azure from the BYOL marketplace image, using an ARM template, a parameters file and a cloud-init file. Allow about 30 minutes, most of it waiting for the SSR software to install. A standalone conductor has no redundancy: while it is down, the routers it manages cannot be configured or monitored from it.',
+      '',
+      '## Environment',
+      '',
+      '| Item | Value |',
+      '|---|---|',
+      `| Resource group | ${code(s('resourceGroup'))} |`,
+      `| Region | ${code(s('location'))} |`,
+      `| VNet / subnet | ${code(s('virtualNetworkName'))} / ${code(s('controlSubnetName'))} |`,
+      `| Managed identity | ${code(s('managedIdentity'))} |`,
+      `| Conductor | SSR node ${code(ssrNodeName(values, 0))} (hostname and asset ID ${code(nodeHostname(values, 0))}), VM ${code(s('node0VmName'))}, IP ${code(s('node0PrivateIp'))}, zone ${zone} |`,
+      `| Public IP | ${publicIpText} |`,
+      `| Conductor name | ${code(s('conductorName'))} |`,
+      `| SSR version | ${code(s('ssrVersion'))} |`,
+      '',
+      '## Network topology',
+      '',
+      topologyMarkdown(values),
+      '',
+      '## Prerequisites',
+      '',
+      '- The resource group, VNet, subnet and managed identity listed above exist. The conductor\'s IP is free in the subnet.',
+      '- The subnet has outbound HTTPS access to download the SSR software.',
+      ...(pip.mode === 'existing'
+        ? [`- The existing public IP ${code(pip.name)} is ${pipWhere} and region ${code(s('location'))}, is Standard SKU with static allocation, is not attached to any other resource, and is zone-redundant or in the conductor's zone. Your account needs \`Microsoft.Network/publicIPAddresses/join/action\` on it.`]
+        : []),
+      '- Azure Cloud Shell (PowerShell) with permission to deploy to the resource group.',
+      '- The three deployment files below, uploaded to one Cloud Shell directory (Manage files > Upload). Run every Cloud Shell command from that directory.',
+      `- A terminal with an SSH client and the private key that matches the SSH public key in the parameters file. It must reach the conductor on TCP 22 ${pip.mode === 'none' ? `at its private IP (${code(s('node0PrivateIp'))})` : 'at its public IP, or at its private IP'}, from an address inside the admin allowed range ${code(s('adminAllowedCidr'))}.`,
+      '',
+      '## Files',
+      '',
+      '| File | Purpose |',
+      '|---|---|',
+      `| \`${F.template}\` | ARM template for the conductor node |`,
+      `| \`${F.p0}\` | Template parameters for the conductor |`,
+      `| \`${F.c0}\` | cloud-init with the SSR onboarding configuration |`,
+      '',
+      '> The cloud-init file contains the repository token. Keep it private and delete it from Cloud Shell when the procedure is complete.',
+      '',
+      '## Procedure',
+      '',
+      '### Where each command runs',
+      '',
+      'Azure Cloud Shell is only used for Azure operations: deploying the VM and, if needed, rolling it back. Everything that happens on the conductor runs in an SSH session on it, as root, or in the SSR command line (PCLI) opened from that session. Each step says where it runs:',
+      '',
+      '| Run in | What it is |',
+      '|---|---|',
+      `| ${WHERE.cloudshell.label} | \`az\` commands, one per line. Copy the whole block. |`,
+      `| ${WHERE.terminal.label} | Opens the SSH session to the conductor and becomes root with \`sudo -i\`. |`,
+      `| ${shell} | The root session on the conductor. Multi-line blocks are pasted as a whole. Keep it open until the end. |`,
+      `| ${pcliLabel} | The SSR command line on the conductor, used to accept the conductor's own asset. Each PCLI step starts with \`su admin\` in the ${shell}, which opens the PCLI (the prompt becomes \`admin@${ssrNodeName(values, 0)}.${s('conductorName')}#\`), and ends with \`quit\`, which returns to the root shell. Enter PCLI commands one at a time, pressing Enter after each one. |`,
+      '',
+      '### Timing and what to expect',
+      '',
+      'Allow about 30 minutes in total. The deployment command takes up to about 2 minutes. The conductor then downloads, installs and initializes SSR by itself and **reboots twice**: once into the newly installed SSR software, and once after the conductor is initialized. This typically takes 5-15 minutes, and longer if the software download is slow. Each reboot closes your SSH session with a message such as `Connection to ... closed by remote host`. That is normal and not a failure. To watch the reboot cycle, attach to the VM\'s serial console (Azure portal: the VM > Help > Serial console); the template enables the boot diagnostics it needs.',
+      '',
+      ...phaseSection('conductor', 'Setting up the conductor.'),
+      ...stepSections(values, '### Optional: conductor address for managed routers',
+        (n) => `The standalone conductor is complete after step ${n}. The following step${pip.mode === 'none' ? ' tells' : 's tell'} managed routers how to reach the conductor. ${pip.mode === 'none' ? 'It is' : 'They are'} optional at this point because the address routers use (for example a public IP) may only be known after deployment.`),
+      '',
+      '## Rollback',
+      '',
+      'To remove the conductor (for example to retry the deployment), delete its resources, then re-run the procedure from the deploy step.' +
+        (pip.mode === 'existing' ? ' The existing public IP is detached when the NIC is deleted and is kept for the redeploy.' : ''),
+      '',
+      `${CODE_FENCE}powershell`,
+      rollbackCommand(values, 0),
+      CODE_FENCE,
+      '',
+      '## Troubleshooting',
+      '',
+      `Run these in the ${shell}.`,
+      '',
+      ...troubleshootingCommands('Conductor setup errors'),
+      '',
+      TROUBLE_INSTALLING,
+      TROUBLE_FAILED,
+      troubleAsset(code(nodeHostname(values, 0)), shell),
+      ...troubleSsh('conductor'),
+      '',
+    ].join('\n');
+  }
+
   function mopDocument(values) {
+    if (isStandalone(values)) return standaloneMopDocument(values);
     const s = (id) => resolve(values, id);
     const FENCE = '```';
     const customer = s('mopCustomer');
@@ -1055,33 +1440,10 @@
       '',
       'Allow about 60 minutes in total. Each deployment command takes up to about 2 minutes. The node then downloads, installs and initializes SSR by itself and **reboots twice**: once into the newly installed SSR software, and once after the conductor is initialized. This typically takes 5-15 minutes per node, and longer if the software download is slow. Each reboot closes your SSH session with a message such as `Connection to ... closed by remote host`. That is normal and not a failure. To watch the reboot cycle, attach to the VM\'s serial console (Azure portal: the VM > Help > Serial console); the template enables the boot diagnostics it needs.',
       '',
-      'The status command prints one line per minute with the time, the uptime (it drops back to a few minutes after each reboot) and the phase:',
-      '',
-      '| Phase | What the node is doing | Typical duration |',
-      '|---|---|---|',
-      '| `INSTALLING` | Downloading and installing the SSR software. Ends with the first reboot. | Most of the 5-15 minutes; longer on a slow download |',
-      '| `STARTING` | Booting, or waiting for the bootstrapper or SSR to start. | 1-3 minutes after each reboot |',
-      '| `INITIALIZING` | Setting up the conductor (on node1: copying the setup from node0). Ends with the second reboot. | A few minutes |',
-      '| `READY` | Done. The status command stops and lists the conductors. | - |',
-      '| `FAILED` | The bootstrapper stopped with an error. See Troubleshooting. | - |',
-      '',
-      'While a node is `INSTALLING`, `STARTING` or `INITIALIZING`:',
-      '',
-      '- **Let it work.** When your session closes, wait 2-3 minutes, reconnect, run `sudo -i`, and paste the status command again.',
-      '- **Do not** restart, stop or redeploy the VM.',
-      '- **Do not** use `az vm run-command`. Azure runs only one run-command per VM at a time, and a command sent while the VM is rebooting can stay pending for a long time and block every command after it.',
-      '- Only act when the status shows `FAILED`, or when the node has not reached `READY` after 60 minutes.',
+      ...phaseSection('node', 'Setting up the conductor (on node1: copying the setup from node0).'),
     ];
-    const steps = mopSteps(values);
-    const lastRequired = steps.filter((st) => !st.optional).length;
-    steps.forEach((step, i) => {
-      const where = WHERE[step.where];
-      if (step.optional && !steps[i - 1].optional) {
-        out.push('', '### Optional: conductor addresses for managed routers', '',
-          `The HA conductor is complete after step ${lastRequired}. The following steps tell managed routers to use both conductor nodes. They are optional at this point because the addresses routers use (for example public IPs) may only be known after deployment.`);
-      }
-      out.push('', `### Step ${i + 1}${step.optional ? ' (optional)' : ''}: ${step.title}`, '', `**Run in:** ${where.label}`, '', step.text, '', `${FENCE}${where.lang}`, step.cmd, FENCE, '', `Expected: ${step.expect}`);
-    });
+    out.push(...stepSections(values, '### Optional: conductor addresses for managed routers',
+      (n) => `The HA conductor is complete after step ${n}. The following steps tell managed routers to use both conductor nodes. They are optional at this point because the addresses routers use (for example public IPs) may only be known after deployment.`));
     out.push(
       '',
       '## Rollback',
@@ -1098,28 +1460,16 @@
       '',
       'Run these in the root shell of the affected node.',
       '',
-      `${FENCE}bash`,
-      '# Which bootstrapper task failed',
-      'cat /var/log/128T-hardware-bootstrapper/128T-hardware-bootstrapper.txt',
-      '# Download, install and onboarding errors',
-      'grep -nE "ERROR|Exiting with|stderr" /var/log/128T-hardware-bootstrapper/128T-hardware-bootstrapper.log | tail -n 30',
-      '# Conductor and HA setup errors',
-      'grep -iE "error|fail|invalid" /var/log/128technology/initializer.log | tail -n 30',
-      '# SSR download progress',
-      'journalctl -u ember --no-pager | tail -n 40',
-      '# Onboarding configuration not written by cloud-init',
-      'tail -n 30 /var/log/cloud-init-output.log',
-      FENCE,
+      ...troubleshootingCommands('Conductor and HA setup errors'),
       '',
-      '- **`INSTALLING` for more than 60 minutes:** check the SSR download progress. Usual causes are a wrong repository user or token, or no outbound HTTPS from the subnet.',
-      '- **`FAILED`:** the task table shows which task failed. When the initializer fails, the bootstrapper log reports it as `Error enabling release repo`; the real cause is in the `stderr` part of that line and in the initializer log. On failure, a tech-support bundle is saved at `/var/log/128T-hardware-bootstrapper/hardware-bootstrapper-tech-support.zip`.',
+      TROUBLE_INSTALLING,
+      TROUBLE_FAILED,
       `- **node1 \`FAILED\` with \`Error initializing SFTP client: EOF during negotiation\` or \`Invalid credentials for user 't128@${s('node0PrivateIp')}'\`:** node1 could not use the temporary HA peer access on node0 (sudo on node0 did not ask t128 for the password, or access was not open). On node0, run the open HA peer access step again until it prints \`HA_PEER_ACCESS_OPEN\`. Then retry on node1 without redeploying it: run \`systemctl start --no-block 128T-hardware-bootstrapper\` and the status command.`,
       '- **`ERROR: sudo still lets t128 run commands without a password`:** a sudoers rule that sorts after `zz-ha-peer` grants t128 passwordless sudo. Find it with `grep -rn NOPASSWD /etc/sudoers /etc/sudoers.d/`, move it aside, and run the step again. Put it back after HA peer access is closed.',
       '- **`ERROR: sshd does not accept a password for t128 from node1`:** another sshd setting overrides the exception. Check `sshd -T -C user=t128,host=node1,addr=' + s('node1PrivateIp') + ' | grep -i authentication`.',
       '- **`WARNING: another sshd setting still accepts passwords for t128`:** find it with `grep -rni passwordauthentication /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ /etc/128technology/ssh/sshd_config.d/` and remove it.',
-      `- **An asset stays \`Pending\`, or \`show assets\` shows a configured asset that never connects:** the asset ID in the configuration must equal the node's salt minion ID, which is its hostname (\`${nodeHostname(values, 0)}\` / \`${nodeHostname(values, 1)}\`). In the node0 root shell, \`t128-salt-key -L\` lists the IDs that are waiting (\`Unaccepted Keys\`) and accepted. Set the asset ID in the PCLI to the listed ID and commit again. A pending key that is not accepted within 10 minutes is dropped and sent again by the node, so it can briefly disappear from the list.`,
-      '- **SSH refused or timing out:** the node is booting or rebooting; wait 2-3 minutes. If it persists, check that your terminal\'s address is inside the admin allowed range and that nothing else (a subnet NSG, a firewall) blocks TCP 22.',
-      `- **No SSH access at all:** as a last resort, read a log from Cloud Shell with \`az vm run-command invoke --resource-group '<resource group>' --name '<vm>' --command-id RunShellScript --scripts 'tail -n 50 <log file>' --query 'value[0].message' --output tsv\`. Send one command at a time, wait for it to return, and never send one while the node is rebooting.`,
+      troubleAsset(`\`${nodeHostname(values, 0)}\` / \`${nodeHostname(values, 1)}\``, 'node0 root shell'),
+      ...troubleSsh('node'),
       '',
     );
     return out.join('\n');
@@ -1141,44 +1491,58 @@
       if (err) fieldErrors[f.id] = err;
     }
     const v = (id) => String(values[id] ?? '').trim();
-    if (v('node0PrivateIp') && v('node0PrivateIp') === v('node1PrivateIp')) {
-      fieldErrors.node1PrivateIp = 'node0 and node1 need different IPs';
-    }
-    if (v('node0Name') && v('node0Name').toLowerCase() === v('node1Name').toLowerCase()) {
-      fieldErrors.node1Name = 'node0 and node1 need different SSR node names';
-    }
-    for (const n of [0, 1]) {
-      const host = nodeHostname(values, n);
-      if (!fieldErrors[`node${n}Name`] && host.length > 63) {
-        fieldErrors[`node${n}Name`] = `Hostname ${host} is longer than 63 characters; shorten the node or conductor name`;
+    if (isStandalone(values)) {
+      // Only node0's inputs apply; node1 inputs keep their values (for switching back) but are not checked.
+      const host = nodeHostname(values, 0);
+      if (!fieldErrors.node0Name && host.length > 63) {
+        fieldErrors.node0Name = `Hostname ${host} is longer than 63 characters; shorten the node or conductor name`;
       }
-    }
-    if (v('node0VmName') && v('node0VmName') === v('node1VmName')) {
-      fieldErrors.node1VmName = 'node0 and node1 need different VM names';
-    }
-    if (v('availabilitySetName') && (v('node0Zone') || v('node1Zone'))) {
-      fieldErrors.availabilitySetName = 'Availability set and availability zones are mutually exclusive; clear the node zones to use a set';
-    }
-    if (v('availabilitySetName') && v('node1ResourceGroup') && v('node1ResourceGroup').toLowerCase() !== v('resourceGroup').toLowerCase()) {
-      fieldErrors.node1ResourceGroup = 'An availability set needs both VMs in its resource group; clear this or the availability set';
-    }
-    if (v('node1ResourceGroup') && v('node1Location') && separateRegions(values) && !separateVnets(values)) {
-      fieldErrors.node1VirtualNetworkName = 'node1 is in another region, so it needs a VNet in that region';
-    }
-    if (separateVnets(values)) {
-      warnings.push('node0 and node1 are in different VNets: peer them (or otherwise connect them) so the nodes reach each other on their private IPs.');
-    }
-    if (v('node0Zone') && v('node0Zone') === v('node1Zone')) {
-      warnings.push('node0 and node1 are in the same availability zone; use different zones for zone redundancy.');
-    }
-    if (!v('availabilitySetName') && !v('node0Zone') && !v('node1Zone')) {
-      warnings.push('No availability zones or availability set selected: the nodes have no placement redundancy.');
-    }
-    if (v('adminAllowedCidr') === '0.0.0.0/0' && v('publicIpMode') !== 'none') {
-      warnings.push('SSH/HTTPS is open to the Internet (admin CIDR 0.0.0.0/0 with public IPs). Consider restricting it.');
-    }
-    if (v('publicIpMode') === 'existing' && v('node0PublicIpName') && v('node0PublicIpName') === v('node1PublicIpName')) {
-      fieldErrors.node1PublicIpName = 'node0 and node1 need different public IPs';
+      if (v('availabilitySetName') && v('node0Zone')) {
+        fieldErrors.availabilitySetName = 'Availability set and availability zone are mutually exclusive; clear the zone to use a set';
+      }
+      if (v('adminAllowedCidr') === '0.0.0.0/0' && v('publicIpMode') !== 'none') {
+        warnings.push('SSH/HTTPS is open to the Internet (admin CIDR 0.0.0.0/0 with a public IP). Consider restricting it.');
+      }
+    } else {
+      if (v('node0PrivateIp') && v('node0PrivateIp') === v('node1PrivateIp')) {
+        fieldErrors.node1PrivateIp = 'node0 and node1 need different IPs';
+      }
+      if (v('node0Name') && v('node0Name').toLowerCase() === v('node1Name').toLowerCase()) {
+        fieldErrors.node1Name = 'node0 and node1 need different SSR node names';
+      }
+      for (const n of [0, 1]) {
+        const host = nodeHostname(values, n);
+        if (!fieldErrors[`node${n}Name`] && host.length > 63) {
+          fieldErrors[`node${n}Name`] = `Hostname ${host} is longer than 63 characters; shorten the node or conductor name`;
+        }
+      }
+      if (v('node0VmName') && v('node0VmName') === v('node1VmName')) {
+        fieldErrors.node1VmName = 'node0 and node1 need different VM names';
+      }
+      if (v('availabilitySetName') && (v('node0Zone') || v('node1Zone'))) {
+        fieldErrors.availabilitySetName = 'Availability set and availability zones are mutually exclusive; clear the node zones to use a set';
+      }
+      if (v('availabilitySetName') && v('node1ResourceGroup') && v('node1ResourceGroup').toLowerCase() !== v('resourceGroup').toLowerCase()) {
+        fieldErrors.node1ResourceGroup = 'An availability set needs both VMs in its resource group; clear this or the availability set';
+      }
+      if (v('node1ResourceGroup') && v('node1Location') && separateRegions(values) && !separateVnets(values)) {
+        fieldErrors.node1VirtualNetworkName = 'node1 is in another region, so it needs a VNet in that region';
+      }
+      if (separateVnets(values)) {
+        warnings.push('node0 and node1 are in different VNets: peer them (or otherwise connect them) so the nodes reach each other on their private IPs.');
+      }
+      if (v('node0Zone') && v('node0Zone') === v('node1Zone')) {
+        warnings.push('node0 and node1 are in the same availability zone; use different zones for zone redundancy.');
+      }
+      if (!v('availabilitySetName') && !v('node0Zone') && !v('node1Zone')) {
+        warnings.push('No availability zones or availability set selected: the nodes have no placement redundancy.');
+      }
+      if (v('adminAllowedCidr') === '0.0.0.0/0' && v('publicIpMode') !== 'none') {
+        warnings.push('SSH/HTTPS is open to the Internet (admin CIDR 0.0.0.0/0 with public IPs). Consider restricting it.');
+      }
+      if (v('publicIpMode') === 'existing' && v('node0PublicIpName') && v('node0PublicIpName') === v('node1PublicIpName')) {
+        fieldErrors.node1PublicIpName = 'node0 and node1 need different public IPs';
+      }
     }
     const hashes = ['adminPasswordHash', 'rootPasswordHash', 't128PasswordHash'].map(v).filter(Boolean);
     if (hashes.length === 3 && new Set(hashes).size === 1) {
@@ -1463,6 +1827,11 @@
     buildAllFiles,
     mopSteps,
     WHERE,
+    whereFor,
+    isStandalone,
+    fieldView,
+    sectionView,
+    HA_ONLY,
     mopDocument,
     topologyDiagram,
     topologyMarkdown,

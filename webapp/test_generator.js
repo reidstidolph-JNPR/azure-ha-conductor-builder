@@ -22,7 +22,7 @@ function inputsTable() {
   const out = [];
   for (const section of G.SECTIONS) {
     out.push('', `#### ${section.title}`, '');
-    out.push('| # | Input | Required | Default | Description | File: key |', '|---|---|---|---|---|---|');
+    out.push('| # | Input | Applies to | Required | Default | Description | File: key |', '|---|---|---|---|---|---|---|');
     for (const f of G.FIELDS.filter((x) => x.section === section.id)) {
       const n = G.FIELDS.indexOf(f) + 1;
       let def = '-';
@@ -33,7 +33,7 @@ function inputsTable() {
       const used = f.usedIn.map((u) => `\`${cell(u)}\``).join('<br>');
       const cond = f.when && (f.when.set ? `${G.FIELD_BY_ID[f.when.field].label} is set` : `${G.FIELD_BY_ID[f.when.field].label} = \`${f.when.equals}\``);
       const when = f.when ? ` (only when ${cond})` : '';
-      out.push(`| ${n} | ${text(f.label)} | ${f.required ? 'Yes' : 'No'}${when} | ${def} | ${text(f.help)}${ph} | ${used} |`);
+      out.push(`| ${n} | ${text(f.label)} | ${f.haOnly ? '*HA only*' : 'HA and standalone'} | ${f.required ? 'Yes' : 'No'}${when} | ${def} | ${text(f.help)}${ph} | ${used} |`);
     }
   }
   return `${out.join('\n')}\n`;
@@ -48,10 +48,11 @@ function replaceBlock(text, marker, content) {
   return `${text.slice(0, start + begin.length)}${content}${text.slice(stop)}`;
 }
 
-/* README.md with its generated blocks (topology for placeholder inputs, inputs table) refreshed. */
+/* README.md with its generated blocks (HA and standalone topology for placeholder inputs, inputs table) refreshed. */
 function readmeWithGenerated(readme) {
   const topology = `\n${G.topologyMarkdown(G.defaults())}\n`;
-  return replaceBlock(replaceBlock(readme, 'TOPOLOGY', topology), 'INPUTS-TABLE', inputsTable());
+  const standalone = `\n${G.topologyMarkdown(Object.assign(G.defaults(), { deploymentMode: 'standalone' }))}\n`;
+  return replaceBlock(replaceBlock(replaceBlock(readme, 'TOPOLOGY', topology), 'STANDALONE-TOPOLOGY', standalone), 'INPUTS-TABLE', inputsTable());
 }
 
 if (process.argv.includes('--write')) {
@@ -572,6 +573,122 @@ test('custom SSR node names reach the initializer, the PCLI steps and the topolo
   assert.ok(bad({ conductorName: 'C'.repeat(57), node0Name: 'n'.repeat(10) }).node0Name, 'hostname longer than 63 characters');
 });
 
+test('standalone deployment: one node, no HA inputs, files or steps', () => {
+  const standalone = (over = {}) => Object.assign(filled(), { deploymentMode: 'standalone' }, over);
+  const values = standalone();
+
+  // Bundle: MOP plus node0's parameters and cloud-init (the template is added as a static file).
+  assert.deepStrictEqual(G.buildGeneratedFiles(values).map((f) => f.path), [G.FILES.mop, G.FILES.p0, G.FILES.c0]);
+  assert.deepStrictEqual(G.buildAllFiles(values, { [G.FILES.template]: '{}' }).map((f) => f.path),
+    [G.FILES.mop, G.FILES.template, G.FILES.p0, G.FILES.c0]);
+
+  // Parameters: no HA peer; every parameter exists in the template and every required one is provided.
+  const template = JSON.parse(fs.readFileSync(path.join(BUNDLE_DIR, 'conductor_template.json'), 'utf8'));
+  const params = JSON.parse(G.buildGeneratedFiles(values).find((f) => f.path === G.FILES.p0).content).parameters;
+  assert.ok(!('haPeerPrivateIp' in params));
+  for (const name of Object.keys(params)) assert.ok(name in template.parameters, name);
+  for (const [name, def] of Object.entries(template.parameters)) {
+    if (!('defaultValue' in def)) assert.ok(name in params || name === 'customData', `required parameter ${name}`);
+  }
+  assert.strictEqual(params.controlPrivateIp.value, '10.0.1.10');
+
+  // Template: the HA peer rule is only added when haPeerPrivateIp is set.
+  assert.deepStrictEqual(template.parameters.haPeerPrivateIp, { type: 'string', defaultValue: '', metadata: template.parameters.haPeerPrivateIp.metadata });
+  const nsg = template.resources.find((r) => r.type === 'Microsoft.Network/networkSecurityGroups');
+  assert.strictEqual(nsg.properties.securityRules,
+    "[if(empty(parameters('haPeerPrivateIp')), variables('baseSecurityRules'), concat(variables('baseSecurityRules'), variables('haPeerSecurityRules')))]");
+  assert.deepStrictEqual(template.variables.baseSecurityRules.map((r) => r.name), ['adminSSH', 'adminHTTPs', 'control', 'secureConductorOnboarding', 'automatedProvisioner']);
+  assert.deepStrictEqual(template.variables.haPeerSecurityRules.map((r) => r.properties.sourceAddressPrefix), ["[concat(parameters('haPeerPrivateIp'), '/32')]"]);
+  const haParams = JSON.parse(G.buildGeneratedFiles(filled()).find((f) => f.path === G.FILES.p0).content).parameters;
+  assert.strictEqual(haParams.haPeerPrivateIp.value, '10.0.1.11', 'HA still sets the peer');
+
+  // Onboarding config: node0, no HA keys; the cloud-init says standalone.
+  const cfg = G.onboardingConfig(values, 0);
+  assert.strictEqual(cfg['node-name'], 'node0');
+  assert.ok(!('clustered' in cfg));
+  assert.deepStrictEqual(Object.keys(cfg['initializer-overrides']), ['router-name', 'node-name', 'node-ip', 'timezone']);
+  const cloudInit = G.buildGeneratedFiles(values).find((f) => f.path === G.FILES.c0).content;
+  assert.ok(cloudInit.includes('# Standalone SSR conductor - a single node, no HA peer.'));
+  assert.ok(!/ha-peer|learn-from|unsafe/.test(cloudInit));
+
+  // Inputs: HA-only fields are inactive, hidden, not required and not validated.
+  for (const id of G.HA_ONLY) {
+    assert.ok(!G.isActive(values, id), `${id} inactive in standalone`);
+    assert.ok(G.isActive(Object.assign(filled(), { node1ResourceGroup: 'rg-b', publicIpMode: 'existing' }), id), `${id} active in HA`);
+  }
+  const bare = standalone({ node1PrivateIp: '', haPeerPassword: '' });
+  assert.deepStrictEqual(G.validate(bare), { fieldErrors: {}, warnings: [], missing: [] });
+  const clashing = standalone({ node1PrivateIp: '10.0.1.10', node1Name: 'node0', node1VmName: 'conductor-node0', node0Zone: '', availabilitySetName: 'set', node1ResourceGroup: 'rg-b' });
+  assert.deepStrictEqual(G.validate(clashing).fieldErrors, {}, 'node1 values are ignored');
+  assert.ok(Object.keys(G.validate(Object.assign({}, clashing, { deploymentMode: 'ha' })).fieldErrors).length >= 4, 'the same values are errors in HA');
+  assert.ok(G.validate(standalone({ availabilitySetName: 'set' })).fieldErrors.availabilitySetName, 'zone and set still exclusive');
+  assert.ok(G.validate(standalone({ conductorName: 'C'.repeat(57), node0Name: 'n'.repeat(10) })).fieldErrors.node0Name);
+
+  // Form wording: nothing shown in standalone refers to node1, its files or the HA pair.
+  for (const f of G.FIELDS) {
+    if (!G.isActive(values, f.id)) continue;
+    const view = G.fieldView(values, f.id);
+    const shown = [view.label, view.help, ...view.usedIn, ...(view.options || []).map((o) => (typeof o === 'string' ? o : o.label))].join(' | ');
+    if (f.id === 'deploymentMode') continue;
+    assert.ok(!/node1|both nodes|each node|per node|both VMs|HA peer|HA address|conductor nodes|the VMs/i.test(shown), `${f.id}: ${shown}`);
+    assert.ok(!view.usedIn.some((u) => u.startsWith(`${G.FILES.p1}:`) || u.startsWith(`${G.FILES.c1}:`)), f.id);
+  }
+  assert.strictEqual(G.fieldView(values, 'node0PrivateIp').label, 'Private IP');
+  assert.strictEqual(G.fieldView(filled(), 'node0PrivateIp').label, 'node0 private IP', 'HA wording unchanged');
+  assert.deepStrictEqual(G.SECTIONS.filter((sec) => G.sectionView(values, sec.id).hidden).map((sec) => sec.id), ['node1rg', 'ha']);
+  assert.deepStrictEqual(G.SECTIONS.filter((sec) => G.sectionView(filled(), sec.id).hidden).map((sec) => sec.id), []);
+  assert.strictEqual(G.sectionView(values, 'nodes').title, 'Conductor node');
+
+  // MOP: the short procedure, with no HA step or HA wording.
+  const steps = G.mopSteps(values);
+  assert.deepStrictEqual(steps.map((st) => st.title), [
+    'Confirm the Azure subscription', 'Accept the marketplace image terms', 'Deploy the conductor', 'Connect to the conductor',
+    'Wait until the conductor is initialized', "Accept the conductor's asset", 'Verify the conductor', 'Set the conductor address for managed routers']);
+  assert.deepStrictEqual(steps.map((st) => st.where), ['cloudshell', 'cloudshell', 'cloudshell', 'terminal', 'node0', 'pcli0', 'pcli0', 'pcli0']);
+  assert.deepStrictEqual(steps.map((st) => st.optional), [false, false, false, false, false, false, false, true]);
+  for (const step of steps) {
+    assert.ok(!/\{\{step:/.test(step.text + step.expect), step.title);
+    if (step.where === 'cloudshell') step.cmd.split('\n').forEach((line) => assert.strictEqual(parsePowerShellArgs(line)[0], 'az'));
+    else if (step.where === 'pcli0') assert.ok(step.cmd.startsWith('su admin\n') && step.cmd.endsWith('\nquit'), step.title);
+    else execFileSync('bash', ['-n', '-c', step.cmd]);
+  }
+  const byTitle = Object.fromEntries(steps.map((st) => [st.title, st]));
+  assert.strictEqual(byTitle["Accept the conductor's asset"].cmd, 'su admin\nconfig authority router Conductor node node0 asset-id Conductor-node0\ncommit force\nshow assets\nquit');
+  assert.strictEqual(byTitle['Verify the conductor'].cmd, 'su admin\nshow assets\nshow system\nquit');
+  assert.strictEqual(byTitle['Set the conductor address for managed routers'].cmd, 'su admin\nconfig authority conductor-address 10.0.1.10\ncommit force\nquit');
+  assert.ok(byTitle['Wait until the conductor is initialized'].text.includes('reconnect with step 4'));
+  assert.ok(byTitle['Connect to the conductor'].text.includes('"conductor root shell"') && byTitle['Connect to the conductor'].text.includes('parameters file is not'));
+  assert.strictEqual(G.whereFor(values, 'pcli0').label, 'conductor PCLI (admin)');
+  assert.strictEqual(G.whereFor(filled(), 'pcli0').label, 'node0 PCLI (admin)');
+
+  const pub = G.mopSteps(standalone({ publicIpMode: 'existing', node0PublicIpName: 'pip-a' }));
+  assert.deepStrictEqual(pub.filter((st) => st.optional).map((st) => st.title), ['Look up the conductor address', 'Set the conductor address for managed routers']);
+  assert.ok(!pub.find((st) => st.title === 'Look up the conductor address').cmd.includes('\n'), 'one node to look up');
+  assert.ok(pub.find((st) => st.title === 'Set the conductor address for managed routers').cmd.includes('conductor-address <conductor-address>\n'));
+  assert.ok(pub.find((st) => st.title === 'Connect to the conductor').cmd.startsWith('ssh t128@<conductor-public-ip>'));
+
+  for (const over of [{}, { publicIpMode: 'create' }, { publicIpMode: 'existing', node0PublicIpName: 'pip-a' }, { node0Name: 'east-1', conductorName: 'Acme' }]) {
+    const mop = G.mopDocument(standalone(over));
+    assert.ok(mop.startsWith('# MOP: Standalone SSR conductor in Azure'));
+    assert.ok(!/node1|HA peer|HA_PEER|ha-peer|zz-ha-peer|temporary|HA pair|both nodes|each node|two nodes|node0 root shell|node0 PCLI/i.test(mop.replace('there is no HA sync or fabric interface', '')), JSON.stringify(over));
+    assert.ok(!mop.includes('conductor-node1'), 'no node1 VM in rollback or elsewhere');
+    assert.ok(mop.includes('three deployment files'));
+    assert.ok(mop.includes(`\`\`\`text\n${G.topologyDiagram(standalone(over))}\n\`\`\``));
+  }
+  assert.ok(G.mopDocument(standalone({ node0Name: 'east-1', conductorName: 'Acme' })).includes('config authority router Acme node east-1 asset-id Acme-east-1'));
+
+  // Topology: one aligned VM box, no HA sync link and no HA peer NSG rule.
+  for (const over of [{}, { publicIpMode: 'create', node0VmName: 'a-much-longer-conductor-vm-name-0' }, { publicIpMode: 'existing', node0PublicIpName: 'pip-a' }]) {
+    const lines = G.topologyDiagram(standalone(over)).split('\n');
+    const bus = lines.find((l) => l.startsWith('═'));
+    const boxes = lines.filter((l) => /^[┌│└]/.test(l));
+    for (const l of boxes) assert.strictEqual(l.length, bus.length, `misaligned row: ${l}`);
+    assert.strictEqual(lines.filter((l) => l.includes('Azure VM ')).length, 1);
+    assert.ok(boxes.filter((l) => l.includes('┬') || l.includes('┴')).every((l) => [l.indexOf('┬'), l.indexOf('┴')].includes(bus.indexOf('╧'))));
+    assert.ok(!lines.some((l) => /HA|<──|peer/.test(l)), lines.join('\n'));
+  }
+});
+
 test('cross-field validation', () => {
   const values = filled();
   values.node1PrivateIp = values.node0PrivateIp;
@@ -593,6 +710,15 @@ test('zip archive is readable by unzip', () => {
   } finally {
     fs.unlinkSync(tmp);
   }
+});
+
+test('hidden inputs and sections really disappear in the page', () => {
+  // The form hides inactive inputs and sections with the hidden attribute; fieldsets are display: grid, which would
+  // override the browser's default [hidden] style, so the page needs its own rule.
+  const html = fs.readFileSync(path.join(__dirname, 'index.src.html'), 'utf8');
+  assert.ok(html.includes('[hidden] { display: none !important; }'));
+  const app = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
+  assert.ok(app.includes('fieldset.hidden = view.hidden;') && app.includes("$(`#w-${f.id}`).hidden = !G.isActive(state.values, f.id);"));
 });
 
 test('index.html is up to date with its sources', () => {

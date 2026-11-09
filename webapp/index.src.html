@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SSR HA Conductor on Azure - Deployment Builder</title>
+<title>SSR Conductor on Azure (HA or standalone) - Deployment Builder</title>
 <style>
   :root {
     --bg: #f5f7f9; --panel: #fff; --text: #1d2733; --muted: #5d6b7a; --border: #d7dee6;
@@ -11,6 +11,8 @@
     --code-bg: #0f1720; --code-text: #e3e9ef; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
+  /* Elements hidden with the hidden attribute stay hidden even when a rule sets their display (fieldset is a grid). */
+  [hidden] { display: none !important; }
   body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg); }
   header { background: #12324a; color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
   header h1 { font-size: 18px; margin: 0; font-weight: 600; }
@@ -124,7 +126,7 @@
 </head>
 <body>
 <header>
-  <h1>Session Smart HA Conductor on Azure</h1>
+  <h1>Session Smart Conductor on Azure (HA or standalone)</h1>
   <span class="sub">Deployment file builder: everything runs locally in your browser, nothing is uploaded.</span>
 </header>
 <nav>
@@ -163,12 +165,12 @@
       <button id="btn-collapse-all">Collapse all</button>
       <span id="zip-warning"></span>
     </div>
-    <p class="note">Click a file to review its contents. The bundle is the MOP plus the five deployment files.</p>
+    <p class="note" id="bundle-note">Click a file to review its contents.</p>
     <div id="file-list"></div>
 
     <div class="card" style="margin-top:16px">
       <h3 style="margin-top:0">MOP commands</h3>
-      <p class="note">The procedure from <code>MOP.md</code>. Azure Cloud Shell (PowerShell) is only used to deploy the VMs, from the directory holding the five deployment files. Every node step runs in an SSH root shell on that node (paste multi-line shell blocks as a whole), or in the node0 PCLI: PCLI steps start with <code>su admin</code> and end with <code>quit</code>, and their commands are entered one at a time. Wait for the expected result of each step before running the next, and expect each node to reboot by itself during initialization.</p>
+      <p class="note">The procedure from <code>MOP.md</code>. Azure Cloud Shell (PowerShell) is only used to deploy the conductor VMs (one for a standalone conductor, two for HA), from the directory holding the deployment files. Every node step runs in an SSH root shell on that node (paste multi-line shell blocks as a whole), or in the PCLI opened from that shell: PCLI steps start with <code>su admin</code> and end with <code>quit</code>, and their commands are entered one at a time. Wait for the expected result of each step before running the next, and expect each node to reboot by itself during initialization.</p>
       <ol id="steps"></ol>
     </div>
   </section>
